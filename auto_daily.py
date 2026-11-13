@@ -29,6 +29,9 @@ if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE = Path(__file__).resolve().parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+import game_proc   # noqa: E402  温和关闭游戏进程（先礼后兵，见 game_proc.py 顶部说明）
 CONFIG = BASE / "config" / "daily_config.yaml"
 LOG_DIR = BASE / "logs"
 LOCK_FILE = BASE / "_auto_daily.lock"
@@ -136,7 +139,9 @@ def run_game(game_key, games_cfg, dry_run=False):
             pass
         # ★ 顺序很重要：先杀游戏并等它彻底退出（Unity 退出瞬间会回写注册表），再恢复屏幕设置。
         #   反过来做的话，游戏退出时会把窗口化又写回去 —— 用户第二天自己开游戏就是窗口。
-        kill_game(g.get("client_path"))
+        if not kill_game(g.get("client_path")):
+            log.warning("[%s] 游戏进程没能优雅关闭（见上一行警告）；仍然恢复屏幕设置，"
+                        "之后由收尾保险再检查一次", game_key)
         # 引擎/游戏都退干净后，给适配器一个收尾机会（例如绝区零换回用户的全屏显示档）
         try:
             hook = getattr(adapter, "after_kill", None)
@@ -156,17 +161,26 @@ def run_game(game_key, games_cfg, dry_run=False):
 
 
 def kill_game(client_path):
-    """"强制结束游戏并等待进程彻底退出（游戏退出瞬间会回写注册表，必须等它死透再恢复显示）"""
+    """温和结束游戏并等它彻底退出（True = 进程已经不在）。
+
+    2026-11-14 改：以前这里是【无条件】`taskkill /IM <exe> /F`，用在 run_game 的
+    finally 里。2026-11-13 12:47 那次，BetterGI 重试时刚把原神拉起来 1 秒，就被这行
+    硬杀；当晚原神要求重新登录（游戏日志 `failed to parse account list` ×20 =
+    本地快速登录缓存读不出来）。所以现在一律走 game_proc.close：
+    先 WM_CLOSE 让游戏自己退（它才有机会把本地缓存/账号数据写完），
+    刚启动不到 180 秒的进程【绝不强杀】—— 宁可这趟不跑，也不再写坏一次账号。"""
     try:
         exe = Path(client_path).name
-        _run_hidden(["taskkill", "/IM", exe, "/F"])
-        for _ in range(30):   # 最多等 30s
-            r = _run_hidden(["tasklist", "/FI", f"IMAGENAME eq {exe}"], text=True)
-            if exe not in r.stdout:
-                break
-            time.sleep(1)
-    except Exception:
-        pass
+        if not game_proc.running(exe):
+            return True
+        ok = game_proc.close(exe, grace_s=45, force_after_s=180)
+        if not ok:
+            log.warning("[收尾] %s 没能优雅关闭，本次不硬杀（防止再次损坏本地登录缓存）；"
+                        "它自己退出后会把窗口化设置写回去，后面由收尾保险再修一次", exe)
+        return ok
+    except Exception as e:
+        log.warning("[收尾] 结束游戏失败: %s", e)
+        return False
 
 
 def _final_display_safety(games):

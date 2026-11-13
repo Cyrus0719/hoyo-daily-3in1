@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 def _run_hidden(cmd, **kw):
     """静默子进程：无控制台窗口（提权 pythonw 下反复闪终端的问题修复）。"""
     kw.setdefault("capture_output", True)
@@ -33,6 +34,12 @@ BASE = Path(__file__).resolve().parent.parent          # 项目根目录（本�
 BETTERGI_DIR = Path(os.environ.get("HOYO_BETTERGI_DIR") or (BASE / "tools" / "BetterGI" / "BetterGI"))
 sys.path.insert(0, str(BASE))   # 能 import 到项目根的模块
 import win_guard   # noqa: E402  游戏窗口兜底（16:9 检查/纠正）
+import game_proc   # noqa: E402  温和关闭游戏进程（先礼后兵，见 game_proc.py 顶部说明）
+try:
+    import login_helper   # noqa: E402  掉登录时自动用账号密码登录（绝不用验证码）
+except Exception as _login_err:   # noqa: BLE001  依赖缺失不该拖垮整个适配器
+    login_helper = None
+    logging.getLogger(__name__).warning("[login] 登录兜底不可用: %s", _login_err)
 BETTERGI_EXE = BETTERGI_DIR / "BetterGI.exe"
 ONEDRAGON_DIR = BETTERGI_DIR / "User" / "OneDragon"
 # 日志在包根目录的 log/ 下（User/log 是旧路径，实测不存在 —— 之前完成标记因此一直没生效）
@@ -89,38 +96,55 @@ def kill_bettergi_if_running():
     time.sleep(1)
 
 
-def _close_game(exe: str, grace_s: int = 8) -> bool:
-    """先礼后兵地关掉游戏：先发 WM_CLOSE（taskkill 不带 /F），等一段时间；还在才硬杀。
+def _close_game(exe: str, grace_s: int = 45) -> bool:
+    """温和关闭游戏进程 —— 真正的规则在 game_proc.close（先 WM_CLOSE，等它自己退）。
 
-    2026-11-13：以前一律 /F 硬杀。硬杀时游戏来不及回写自己的设置/登录态，
-    半途被打死的客户端也更容易留下坏档（"经常要求重新登录"的可疑因素之一），
-    能正常关就先正常关。返回 True 表示进程已经退出。"""
-    try:
-        _run_hidden(["taskkill", "/IM", exe], capture_output=True)     # 礼貌：WM_CLOSE
-        for _ in range(grace_s):
-            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
-                            capture_output=True, text=True)
-            if exe.lower() not in (r.stdout or "").lower():
-                log.info("[BetterGI] %s 已正常退出", exe)
-                return True
-            time.sleep(1)
-        log.warning("[BetterGI] %s 没有正常退出，改用强制结束", exe)
-        _run_hidden(["taskkill", "/IM", exe, "/F"], capture_output=True)
-        for _ in range(20):
-            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
-                            capture_output=True, text=True)
-            if exe.lower() not in (r.stdout or "").lower():
-                return True
-            time.sleep(1)
-    except Exception as e:
-        log.warning("[BetterGI] 关闭游戏失败: %s", e)
-    return False
+    2026-11-14 改：以前是本文件里的「礼貌 8 秒 → 直接 /F」。8 秒太短，也不看进程
+    刚启动多久。2026-11-13 12:47 原神就是在启动 1 秒时被 /F 硬杀，当晚游戏要求
+    重新登录（本地快速登录缓存被写坏）。现在只有存活 >= 180 秒的进程才允许强杀，
+    刚启动的进程返回 False，由调用方按「游戏还开着」处理。
+    返回 True = 进程已经退出。"""
+    return game_proc.close(exe, grace_s=grace_s, force_after_s=180)
 
 
-def kill_game_if_running(client_path: str = "") -> None:
-    """关掉原神客户端并等它彻底退出（让 BetterGI 自己走"打开游戏 → 进游戏"的完整流程）。"""
+def kill_game_if_running(client_path: str = "") -> bool:
+    """关掉原神客户端并等它彻底退出（让 BetterGI 自己走"打开游戏 → 进游戏"的完整流程）。
+    返回 True = 游戏已经不在运行（False 表示它刚启动、我们拒绝强杀）。"""
     exe = Path(client_path).name if client_path else "YuanShen.exe"
-    _close_game(exe)
+    return _close_game(exe)
+
+
+# ── 原神本地「快速登录」缓存体检（2026-11-14 新增）────────────────────
+# 游戏自己的日志（不是 BetterGI 的）在 LocalLow 下。本地账号列表解析失败时会出现
+# `failed to parse account list` + `Decode exception has occurred.`，游戏就停在登录页，
+# 一条龙再多跑几趟也进不去 —— 必须让用户手动登录一次。这里只做「提前说清楚」。
+GENSHIN_LOCALLOW = (Path(os.environ.get("USERPROFILE", "") or ".")
+                    / "AppData" / "LocalLow" / "miHoYo" / "原神")
+GENSHIN_GAME_LOG = GENSHIN_LOCALLOW / "output_log.txt"
+LOGIN_FAIL_MARKS = ("failed to parse account list", "Decode exception has occurred")
+_LOGIN_CACHE_BROKEN = False       # 本次运行里是否发现登录缓存坏了（坏了就不重试）
+
+
+def _game_log_size() -> int:
+    try:
+        return GENSHIN_GAME_LOG.stat().st_size
+    except OSError:
+        return -1
+
+
+def _game_log_new(base: int, max_bytes: int = 4_000_000) -> str:
+    """原神自己日志里「本次新增」的部分（文件被换/截断时退回读全量尾部）。"""
+    try:
+        size = GENSHIN_GAME_LOG.stat().st_size
+        if size <= 0:
+            return ""
+        start = base if 0 <= base <= size else max(0, size - max_bytes)
+        with GENSHIN_GAME_LOG.open("rb") as fp:
+            fp.seek(start)
+            data = fp.read(min(size - start, max_bytes))
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 LEYLINE_ASSET = BETTERGI_DIR / "GameTask" / "AutoLeyLineOutcrop" / "Assets" / "config.json"
@@ -492,6 +516,11 @@ def _should_retry() -> bool:
       · 出现"任务被取消/A task was canceled/游戏已退出/请先启动BetterGI" → 早死（11-09 的形态）
       · 日志里没有任何"任务启动"记录 → 空转
     """
+    if _LOGIN_CACHE_BROKEN:
+        # 2026-11-14：本地快速登录缓存坏了，重开游戏也只会又停在登录页 ——
+        # 而且多开一次游戏就多一次写坏别的本地数据的风险，直接放弃重试。
+        log.warning("[BetterGI] 原神本地快速登录缓存异常，跳过重试（需要用户手动登录一次）")
+        return False
     text = _new_log_text()
     if not text.strip():
         return True
@@ -614,7 +643,10 @@ class BetterGIAdapter:
         self.finished = False
         self.failed = False
         self._guard = None
+        self._login_stop = None   # 登录兜底线程的停止信号（见 start()）
         self._last_elapsed = 0.0   # 上一趟跑了多少秒（用来识别"10 秒就收工"的早退）
+        self._game_log_base = -1   # 原神自己 output_log.txt 的基线（查本地登录缓存有没有坏）
+        self._run_started_at = time.time()   # 本次开跑时刻（判断游戏日志是不是这次写的）
 
     def _run_one_dragon(self, target: dict, timeout_s: int, idx: int, override: dict = None) -> None:
         """起一趟一条龙并等它跑完。"""
@@ -645,12 +677,18 @@ class BetterGIAdapter:
 
     def start(self):
         # 每次运行都重置「这次补全过哪些角色」，别让上一次的残留影响这次的重试判断
-        global _HEAL_ADDED
+        global _HEAL_ADDED, _LOGIN_CACHE_BROKEN
         _HEAL_ADDED = []
+        _LOGIN_CACHE_BROKEN = False
         kill_bettergi_if_running()   # 保证单实例（startOneDragon 参数走激活流程）
-        kill_game_if_running(self.cfg.get("client_path", ""))   # 先关游戏：让它自己从登录界面进游戏，
+        if not kill_game_if_running(self.cfg.get("client_path", "")):
+            log.warning("[BetterGI] 游戏进程还开着，而且是刚启动的（拒绝强杀）；"
+                        "BetterGI 会接管这个已在运行的游戏，通常也能正常进世界")
+                                     # 先关游戏：让它自己从登录界面进游戏，
                                      # 否则用户把游戏停在某个界面时 BetterGI 会一直等（实测 10/3-10/5 空等一小时）
         _log_baseline()              # 记日志基线：只看本次新增的内容
+        self._run_started_at = time.time()
+        self._game_log_base = _game_log_size()   # 原神自己日志的基线（查本地快速登录缓存）
         if not self.targets:
             self.finished = True
             return
@@ -661,6 +699,17 @@ class BetterGIAdapter:
         # 危战开着时它先吃树脂；没开时 BetterGI 自己跳过，接着按当天规则打地脉花/秘境。
         # ※ 曾为了"树脂全给危战"拆成两趟（第二趟重开游戏），10/10 实测第二趟进至冬秘境按 F 之后
         #   BetterGI 直接没了、树脂一点没花 —— 换新游戏会话风险太大，回退单趟。
+        # 【登录兜底】BetterGI 自己没有登录能力：游戏停在登录界面时它只会干等，
+        #   等不到就自己杀游戏重开（2026-11-09 就是这样白跑一趟）。所以起一个后台线程
+        #   盯着游戏窗口，一旦认出登录界面就用【账号密码登录】把账号密码填进去
+        #   （看到「手机验证码」立即停手，一次运行最多提交一次，见 login_helper.py）。
+        self._login_stop = threading.Event()
+        if login_helper is not None and self.cfg.get("auto_login", True):
+            try:
+                login_helper.watch("YuanShen.exe", "genshin", stop_event=self._login_stop,
+                                   timeout_s=timeout_s + 600, interval_s=10)
+            except Exception as e:   # noqa: BLE001
+                log.warning("[BetterGI] 登录兜底线程没起来（不影响主流程）: %s", e)
         self._run_one_dragon(t, timeout_s, 0, None)
         # 【重试一次】第一趟没跑完（没有完成标记）通常发生在"开机后第一次启动游戏特别慢"
         #   或者引擎自己把游戏杀掉重开的时候。2026-11-09 就是：07:00 开机、07:10 就跑，
@@ -669,15 +718,28 @@ class BetterGIAdapter:
         #   只重试一次，避免无限循环。
         # 早退（< 3 分钟就自己收工）也算"值得重试"：2026-11-13 那两趟分别只活了 10 秒和 1.4 秒，
         #   日志里一个失败特征都没留下，_should_retry() 看不出来，于是只跑一趟就放弃了。
-        if self.failed and (_should_retry() or self._last_elapsed < 180):
+        if self.failed and not _LOGIN_CACHE_BROKEN and (_should_retry() or self._last_elapsed < 180):
             log.warning("[BetterGI] 第一趟没有跑完（耗时 %.0f 秒），准备重试一次"
                         "（先杀干净引擎和游戏，等它彻底退出，重置日志基线）", self._last_elapsed)
             kill_bettergi_if_running()
-            kill_game_if_running(self.cfg.get("client_path", ""))
-            time.sleep(15)   # 8 秒时游戏进程/文件锁常常还没退干净，第二趟会秒退
-            _log_baseline()
-            self.failed = False
-            self._run_one_dragon(t, timeout_s, 1, None)
+            game_exe = Path(self.cfg.get("client_path", "") or "YuanShen.exe").name
+            closed = kill_game_if_running(self.cfg.get("client_path", ""))
+            # 2026-11-14 改：原来只等 15 秒就重开游戏（两次启动只隔 24 秒）。2026-11-13 那晚
+            # 就是这样把原神的本地快速登录缓存弄坏的（游戏要求重新登录）。现在必须：
+            # 游戏真的退了 + 再多等 45 秒让它把本地缓存/设置写完，才允许跑第二趟。
+            if closed:
+                closed = game_proc.wait_gone(game_exe, 90)
+            if not closed:
+                log.error("[BetterGI] 游戏进程没退干净 → 放弃第二趟（不再连环快开快关游戏，"
+                          "那正是写坏原神登录缓存的原因）")
+            else:
+                time.sleep(45)
+                _log_baseline()
+                self._game_log_base = _game_log_size()
+                self.failed = False
+                self._run_one_dragon(t, timeout_s, 1, None)
+        if self._login_stop is not None:
+            self._login_stop.set()
         # 【不删除】daily.json 常驻，用户可在 BetterGI UI 中直接编辑
         self.finished = True
 
@@ -693,6 +755,8 @@ class BetterGIAdapter:
         """auto_daily 契约接口：清理。"""
         if self._guard is not None:
             self._guard.set()
+        if self._login_stop is not None:
+            self._login_stop.set()
         kill_bettergi_if_running()
 
     def _finish_check(self) -> None:
@@ -701,6 +765,7 @@ class BetterGIAdapter:
         2026-11-09 补：光看"失败特征"会漏判 —— 当天一条龙被取消、树脂 0 消耗，
         日志里一条旧特征都没有，于是被报成 ok=True。反过来验：整轮跑完必然会打
         完成标记『一条龙和配置组任务结束』，没有它 = 这轮根本没跑完。"""
+        global _LOGIN_CACHE_BROKEN
         if _report_log_failures():
             self.failed = True
         # 顺手补全战斗脚本：日志里出现「脚本不认识的角色」时把通用连招写进去，
@@ -713,6 +778,24 @@ class BetterGIAdapter:
             log.error("[BetterGI] 本次日志里没有完成标记『%s』—— 整轮任务没有跑完"
                       "（多半是游戏/引擎中途退出或被取消）", COMPLETE_MARK)
             self.failed = True
+        # 原神自己的日志：本地「快速登录」账号列表解析失败 → 这一趟必然停在登录页，
+        # 重开游戏也没用，只能让用户手动登录一次（2026-11-13 那次事故的症状）。
+        try:
+            # 只在「这趟真的启动过游戏」时才看：Unity 每次启动会重写 output_log.txt，
+            # 游戏没起来时文件里留的还是上一趟的内容，直接读会把旧账算到这次头上。
+            try:
+                fresh = GENSHIN_GAME_LOG.stat().st_mtime >= self._run_started_at - 5
+            except OSError:
+                fresh = False
+            game_new = _game_log_new(self._game_log_base) if fresh else ""
+            if any(m in game_new for m in LOGIN_FAIL_MARKS):
+                _LOGIN_CACHE_BROKEN = True
+                self.failed = True
+                log.error("[BetterGI] 原神本地快速登录数据读取失败（游戏日志里有 failed to parse "
+                          "account list / Decode exception）—— 这一趟停在登录页，判定失败且不重试。"
+                          "请【手动打开一次原神并登录】（勾选记住我），之后自动化才能继续")
+        except Exception as e:
+            log.warning("[BetterGI] 检查原神登录缓存失败: %s", e)
 
     def _wait_exit(self, timeout_s: int) -> bool:
         """等待引擎完成。修复：runas 是异步的，若进程还未出现就判'完成'会误杀刚拉起的引擎。

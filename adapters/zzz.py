@@ -17,7 +17,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # 能 import 到项目根的模块
 import win_guard      # noqa: E402  游戏窗口兜底（16:9 检查/纠正）
+import game_proc      # noqa: E402  温和关闭游戏进程（先礼后兵，见 game_proc.py 顶部说明）
 import display_mode   # noqa: E402  注册表显示设置（两套键）
+try:
+    import login_helper   # noqa: E402  把账号密码写进 OneDragon（原生账号密码登录）
+except Exception as _login_err:   # noqa: BLE001  依赖缺失不该拖垮整个适配器
+    login_helper = None
+    logging.getLogger(__name__).warning("[login] 登录兜底不可用: %s", _login_err)
 
 log = logging.getLogger("auto_daily")
 
@@ -255,12 +261,10 @@ class ZZZAdapter:
             raise FileNotFoundError("OneDragon 未就绪: %s" % ONE_DRAGON_DIR)
         _kill_gui_if_running()
         _ensure_background_mode()
-        _run(["taskkill", "/IM", "ZenlessZoneZero.exe", "/F"])
-        for _ in range(30):
-            r = _run(["tasklist", "/FI", "IMAGENAME eq ZenlessZoneZero.exe"])
-            if b"ZenlessZoneZero.exe" not in r.stdout:
-                break
-            time.sleep(1)
+        # 2026-11-14：不再无条件 /F 硬杀（绝区零的 USD_*.bin 就是账号本地存储，
+        # 硬杀/快开快关有写坏的风险）。game_proc 只在进程存活 >= 180 秒时才允许强杀。
+        if not game_proc.close("ZenlessZoneZero.exe", grace_s=30, force_after_s=180):
+            log.warning("[zzz] 游戏进程还在运行且刚启动（拒绝强杀）；OneDragon 会接管它")
         # 让游戏这次跑窗口模式：优先换成"窗口档"；没有窗口档就把它的设置挪走（回退用注册表）
         if not swap_display_profile(self.cfg, "windowed"):
             stash_game_settings(self.cfg)
@@ -271,6 +275,16 @@ class ZZZAdapter:
             env["HTTP_PROXY"] = proxy
             env["HTTPS_PROXY"] = proxy
         args = [str(PY), str(LAUNCHER), "-c", "-i", INSTANCE]
+        # 【登录兜底】绝区零不用我们自己点：OneDragon 原生支持「国服-账号密码登录」
+        #   （enter_game.py 的 check_login_related/input_account_password）。只要把账号密码
+        #   写进它的 config/01/game_account.yml，掉登录时它会自己选账号密码登录（不是验证码）。
+        if login_helper is not None and self.cfg.get("auto_login", True):
+            try:
+                if not login_helper.ensure_zzz_account(ONE_DRAGON_DIR, INSTANCE):
+                    log.warning("[zzz] 没拿到绝区零账号密码（config/accounts.yaml）——"
+                                "掉登录时 OneDragon 只会报「未配置账号密码」")
+            except Exception as e:   # noqa: BLE001
+                log.warning("[zzz] 写 OneDragon 账号配置失败: %s", e)
         log.info("[zzz] 启动 OneDragon CLI(提权上下文，无 UAC): %s", " ".join(args))
         try:
             log_dir = BASE / "logs"
@@ -329,12 +343,11 @@ class ZZZAdapter:
         if tail:
             log.warning("[zzz] OneDragon 日志尾部: %s", tail[-1200:])
         # 重试前把游戏清干净、窗口档重新铺一遍（否则第二趟会撞上同一个坏窗口）
-        _run(["taskkill", "/IM", "ZenlessZoneZero.exe", "/F"])
-        for _ in range(20):
-            r = _run(["tasklist", "/FI", "IMAGENAME eq ZenlessZoneZero.exe"])
-            if b"ZenlessZoneZero.exe" not in r.stdout:
-                break
-            time.sleep(1)
+        if not game_proc.close("ZenlessZoneZero.exe", grace_s=30, force_after_s=180):
+            log.error("[zzz] 游戏进程没退干净 → 放弃重试（不再连环快开快关游戏）")
+            return False
+        game_proc.wait_gone("ZenlessZoneZero.exe", 30)
+        time.sleep(10)   # 让游戏把本地数据写完再开第二趟（2026-11-14 起不再秒开秒关）
         swap_display_profile(self.cfg, "windowed")
         time.sleep(5)
         env = os.environ.copy()

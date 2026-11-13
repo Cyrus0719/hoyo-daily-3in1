@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 def _run_hidden(cmd, **kw):
     """静默子进程：无控制台窗口（提权 pythonw 下反复闪终端的问题修复）。"""
     kw.setdefault("capture_output", True)
@@ -26,6 +27,12 @@ log = logging.getLogger("auto_daily")
 BASE = Path(__file__).resolve().parent.parent          # 项目根目录
 sys.path.insert(0, str(BASE))                          # 能 import 到项目根的模块
 import win_guard   # noqa: E402  游戏窗口兜底（16:9 检查/纠正）
+import game_proc   # noqa: E402  温和关闭游戏进程（先礼后兵，见 game_proc.py 顶部说明）
+try:
+    import login_helper   # noqa: E402  掉登录时自动用账号密码登录（绝不用验证码）
+except Exception as _login_err:   # noqa: BLE001  依赖缺失不该拖垮整个适配器
+    login_helper = None
+    logging.getLogger(__name__).warning("[login] 登录兜底不可用: %s", _login_err)
 # 部署后路径（下载解压 March7thAssistant_full.zip 到此）；可用 HOYO_MARCH7TH_DIR 覆盖
 M7A_DIR = Path(os.environ.get("HOYO_MARCH7TH_DIR") or (BASE / "tools" / "March7thAssistant"))
 CONFIG_FILE = M7A_DIR / "config.yaml"   # 运行时配置在包根目录（首次运行自动从 example 生成）
@@ -200,35 +207,28 @@ def write_config(cfg: dict, targets: list, game_path: str) -> None:
                            encoding="utf-8")
 
 
-def kill_game_if_running(game_path: str = "") -> None:
-    """关掉已经在跑的崩铁客户端并等它彻底退出。
+def kill_game_if_running(game_path: str = "") -> bool:
+    """关掉已经在跑的崩铁客户端并等它彻底退出（True = 已经不在运行）。
 
     三月七自己的 auto_set_resolution 只对"它自己启动的游戏"有效；对用户手动开着、
     已经全屏的实例，它只会反复提示"请在游戏设置内手动切换为 1920x1080 窗口"，
-    最后一怒之下 terminate + 重启游戏（2026-11-13 现场）。先杀掉，让它从零启动。"""
+    最后一怒之下 terminate + 重启游戏（2026-11-13 现场）。先关掉，让它从零启动。
+
+    2026-11-14 改：统一走 game_proc.close —— 先 WM_CLOSE 让游戏自己退（它要回写本地
+    账号/设置数据），只有存活 >= 180 秒的进程才允许强杀。刚启动的游戏宁可不关。"""
     exe = Path(game_path).name if game_path else "StarRail.exe"
     try:
-        # 先礼后兵：硬杀时游戏来不及回写自己的登录态，能正常关就先正常关
-        # （"经常让我登录"的可疑因素之一；2026-11-13 起统一改成温和关闭优先）
-        _run_hidden(["taskkill", "/IM", exe], capture_output=True)
-        for _ in range(8):
-            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
-                            capture_output=True, text=True)
-            if exe.lower() not in (r.stdout or "").lower():
-                log.info("[March7th] 已在跑的 %s 已正常关闭（让它自己以 1920x1080 窗口启动）", exe)
-                return
-            time.sleep(1)
-        _run_hidden(["taskkill", "/IM", exe, "/F"], capture_output=True)
-        for _ in range(20):
-            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
-                            capture_output=True, text=True)
-            if exe.lower() not in (r.stdout or "").lower():
-                log.info("[March7th] 已在跑的 %s 已强制关闭", exe)
-                return
-            time.sleep(1)
-        log.warning("[March7th] %s 30 秒内没有退出，可能影响分辨率设置", exe)
+        if not game_proc.running(exe):
+            return True
+        ok = game_proc.close(exe, grace_s=45, force_after_s=180)
+        if ok:
+            log.info("[March7th] 已在跑的 %s 已关闭（让它自己以 1920x1080 窗口启动）", exe)
+        else:
+            log.warning("[March7th] %s 还开着且刚启动（拒绝强杀），可能影响分辨率设置", exe)
+        return ok
     except Exception as e:
         log.warning("[March7th] 关闭游戏失败: %s", e)
+        return False
 
 
 class StarRailAdapter:
@@ -239,6 +239,7 @@ class StarRailAdapter:
         self.targets = [t for t in targets if t.get("enabled", True)]
         self.proc = None
         self._guard = None
+        self._login_stop = None   # 登录兜底线程的停止信号（见 start()）
         self._base = {"name": "", "size": 0}
 
     def _is_admin(self) -> bool:
@@ -270,6 +271,16 @@ class StarRailAdapter:
         else:
             ctypes.windll.shell32.ShellExecuteW(None, "runas", str(EXE), "main", str(M7A_DIR), 1)
             log.info("[March7th] 非提权上下文 runas 启动（UAC 一次）")
+        # 【登录兜底】三月七自己没有账号密码登录能力：一遇到「账号登录过期」就原地卡死
+        #   （2026-11-09 白挂 29 分钟，把绝区零挤掉）。这里起后台线程盯游戏窗口，
+        #   认出登录界面就用账号密码登录一次（绝不用手机验证码）。
+        self._login_stop = threading.Event()
+        if login_helper is not None and self.cfg.get("auto_login", True):
+            try:
+                login_helper.watch("StarRail.exe", "starrail", stop_event=self._login_stop,
+                                   timeout_s=3600, interval_s=10)
+            except Exception as e:   # noqa: BLE001
+                log.warning("[March7th] 登录兜底线程没起来（不影响主流程）: %s", e)
         # 窗口兜底：整场盯着游戏窗口，任何时候不是 16:9 就拉回 1920x1080
         self._guard = win_guard.watch_async("starrail")
 
@@ -316,5 +327,7 @@ class StarRailAdapter:
     def stop(self):
         if self._guard is not None:
             self._guard.set()
+        if self._login_stop is not None:
+            self._login_stop.set()
         _run_hidden(["taskkill", "/IM", "March7th Assistant.exe", "/F"], capture_output=True)
         _run_hidden(["taskkill", "/IM", "March7thAssistant.exe", "/F"], capture_output=True)
