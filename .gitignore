@@ -2,6 +2,7 @@ logs/
 config/daily_config.yaml
 config/accounts.yaml
 config/display_user.json
+config/backup/
 config/zzz_display_profiles/
 downloads/
 tools/

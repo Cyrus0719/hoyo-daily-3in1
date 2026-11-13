@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HoYo 每日自动化 · 配置中心</title>
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <img class="logo" src="favicon.png" alt="">
+      <div><b>HoYo 每日自动化</b><span>配置中心</span></div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <div id="footState" class="hint">读取中…</div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="titles">
+        <h1 id="pageTitle">总览</h1>
+        <p id="pageSub"></p>
+      </div>
+      <div class="top-actions">
+        <div class="search"><input id="q" type="text" placeholder="搜索当前页设置项…" autocomplete="off"></div>
+        <button id="btnReload" class="btn ghost" title="重新读取磁盘上的配置">↻ 刷新</button>
+      </div>
+    </header>
+    <div id="view" class="view"></div>
+  </main>
+</div>
+
+<div id="savebar" class="savebar hidden">
+  <span class="dot"></span>
+  <span id="saveText">0 项未保存</span>
+  <div class="grow"></div>
+  <button id="btnDiscard" class="btn ghost">放弃</button>
+  <button id="btnSave" class="btn primary">保存</button>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

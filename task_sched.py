@@ -24,14 +24,31 @@ def task_start_time() -> str:
     return s[11:16] if len(s) >= 16 else ""
 
 
+_LABELS = {
+    "next": ("Next Run Time", "下次运行时间"),
+    "state": ("Status", "模式", "状态"),
+    "last": ("Last Run Time", "上次运行时间"),
+    "last_result": ("Last Result", "上次结果"),
+    "start": ("Start Time", "开始时间"),
+}
+
+
 def task_info() -> dict:
+    """计划任务概况。中文/英文系统的标签名都认（schtasks 的输出随语言变）。"""
     r = _run(["schtasks", "/Query", "/TN", TASK_NAME, "/V", "/FO", "LIST"])
-    info = {"exists": r.returncode == 0, "time": task_start_time(), "next": "", "state": ""}
+    info = {"exists": r.returncode == 0, "time": task_start_time(),
+            "next": "", "state": "", "last": "", "last_result": "", "start": ""}
     for line in (r.stdout or "").splitlines():
-        if "Next Run Time:" in line:
-            info["next"] = line.split(":", 1)[1].strip()
-        if "Status:" in line:
-            info["state"] = line.split(":", 1)[1].strip()
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if not key:
+            continue
+        for field, names in _LABELS.items():
+            if key in names:
+                info[field] = val
+                break
     return info
 
 
