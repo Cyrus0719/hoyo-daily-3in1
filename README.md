@@ -5,7 +5,7 @@
 
 ## 下载
 
-- 最新发布包（zip，含全部调度层代码）：[v1.0.0](https://github.com/Cyrus0719/hoyo-daily-3in1/releases/tag/v1.0.0)
+- 最新发布包（zip，含全部调度层代码）：[Releases](https://github.com/Cyrus0719/hoyo-daily-3in1/releases/latest)（当前 v1.1.0，含配置中心）
 - 三个引擎不在仓库里，由配置中心从**各自官方 Releases** 下载（BetterGI 固定 0.66.0，关闭其自动更新）
 
 ## 这个项目做了什么（以及没做什么）
