@@ -50,6 +50,68 @@ DEFAULT_INSTANCE_NAMES = {
 #   （燃料被"历战余响/沉浸器"先吃掉属于资源分配，不算程序坏了）。
 M7A_SOFT_PATTERNS = ("保留该计划", "每日实训未完成", "合成材料失败", "战斗失败")
 
+# 2026-11-09 事故：崩铁账号登录态过期 —— 三月七 07:18:43 报「尝试启动游戏时发生错误：账号登录过期」，
+#   重试两轮后 07:19:26 彻底放弃，接着每秒一条「截图失败：没有找到游戏窗口」刷到 07:20:25，
+#   然后【进程一直不退出】活到 07:47:36（29 分 17 秒），把绝区零的档期整个挤掉。
+#   所以这里要两件事：① 认得出这类"必死"错误，立刻杀进程并判失败；② 日志停长 = 卡死也杀。
+M7A_FATAL_PATTERNS = ("账号登录过期", "登录过期")
+M7A_FATAL_HINT = "需要你【手动打开一次崩铁并登录】（登录后勾选记住我），之后自动化才能跑"
+
+
+def _log_files():
+    try:
+        return sorted((M7A_DIR / "logs").glob("*.log"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return []
+
+
+def _log_baseline() -> dict:
+    """记下"本次启动时"最新日志的名字与大小，后面只看新增的部分（昨天/上一次的报错不能算今天）。"""
+    files = _log_files()
+    if not files:
+        return {"name": "", "size": 0}
+    try:
+        return {"name": files[0].name, "size": files[0].stat().st_size}
+    except Exception:
+        return {"name": "", "size": 0}
+
+
+def _log_size() -> int:
+    files = _log_files()
+    if not files:
+        return 0
+    try:
+        return files[0].stat().st_size
+    except Exception:
+        return 0
+
+
+def _log_text_after(base: dict) -> str:
+    """取最新日志里"基线之后"的新增文本（跨文件就整份读）。"""
+    files = _log_files()
+    if not files:
+        return ""
+    f = files[0]
+    try:
+        text = f.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    if base and base.get("name") == f.name:
+        return text[int(base.get("size") or 0):]
+    return text
+
+
+def _fatal_hit(text: str) -> str:
+    """本次新增日志里有没有"必死"特征（有就立刻收工，别干等超时）。"""
+    for pat in M7A_FATAL_PATTERNS:
+        if pat in text:
+            return pat
+    # 找不到游戏窗口 = 只会无限截图失败，短时间内反复出现就是死局（今天刷了 58 条）
+    if text.count("没有找到游戏窗口") >= 5:
+        return "连续找不到游戏窗口"
+    return ""
+
 
 def _scan_today_log() -> None:
     """把"本次没干完"的痕迹写进 daily.log：开拓力起止 + 未完成/跳过特征。"""
@@ -138,6 +200,37 @@ def write_config(cfg: dict, targets: list, game_path: str) -> None:
                            encoding="utf-8")
 
 
+def kill_game_if_running(game_path: str = "") -> None:
+    """关掉已经在跑的崩铁客户端并等它彻底退出。
+
+    三月七自己的 auto_set_resolution 只对"它自己启动的游戏"有效；对用户手动开着、
+    已经全屏的实例，它只会反复提示"请在游戏设置内手动切换为 1920x1080 窗口"，
+    最后一怒之下 terminate + 重启游戏（2026-11-13 现场）。先杀掉，让它从零启动。"""
+    exe = Path(game_path).name if game_path else "StarRail.exe"
+    try:
+        # 先礼后兵：硬杀时游戏来不及回写自己的登录态，能正常关就先正常关
+        # （"经常让我登录"的可疑因素之一；2026-11-13 起统一改成温和关闭优先）
+        _run_hidden(["taskkill", "/IM", exe], capture_output=True)
+        for _ in range(8):
+            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
+                            capture_output=True, text=True)
+            if exe.lower() not in (r.stdout or "").lower():
+                log.info("[March7th] 已在跑的 %s 已正常关闭（让它自己以 1920x1080 窗口启动）", exe)
+                return
+            time.sleep(1)
+        _run_hidden(["taskkill", "/IM", exe, "/F"], capture_output=True)
+        for _ in range(20):
+            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
+                            capture_output=True, text=True)
+            if exe.lower() not in (r.stdout or "").lower():
+                log.info("[March7th] 已在跑的 %s 已强制关闭", exe)
+                return
+            time.sleep(1)
+        log.warning("[March7th] %s 30 秒内没有退出，可能影响分辨率设置", exe)
+    except Exception as e:
+        log.warning("[March7th] 关闭游戏失败: %s", e)
+
+
 class StarRailAdapter:
     """崩铁适配器（三月七）。"""
 
@@ -146,6 +239,7 @@ class StarRailAdapter:
         self.targets = [t for t in targets if t.get("enabled", True)]
         self.proc = None
         self._guard = None
+        self._base = {"name": "", "size": 0}
 
     def _is_admin(self) -> bool:
         try:
@@ -157,11 +251,21 @@ class StarRailAdapter:
         if not EXE.exists():
             raise FileNotFoundError(f"未找到三月七主程序: {EXE}（请先下载 March7thAssistant_full.zip 并解压）")
         write_config(self.cfg, self.targets, self.cfg.get("client_path", ""))
+        self._base = _log_baseline()   # 只看本次新增的日志（昨天的报错不能算今天）
+        # 先关掉已经在跑的崩铁再交给三月七启动（同原神适配器的做法）。
+        # 2026-11-13 事故：跑的时候用户正开着全屏 2560x1600 的崩铁 —— 三月七连试 5 次
+        #   「请在游戏设置内手动切换为 1920x1080 窗口」都没成功（win_guard 的 SetWindowPos
+        #   对已运行的全屏游戏同样拉不动）→「游戏分辨率不正确」→ 它自己 terminate+重启 →
+        #   12:49:46 起「截图失败：没有找到游戏窗口」×10 → 我们判必死杀进程，整轮 ok=False。
+        kill_game_if_running(self.cfg.get("client_path", ""))
         log.info("[March7th] 启动完整运行 main ...")
         # 提权感知启动：定时任务(/RL HIGHEST)已是管理员 -> 直接启动【无 UAC】；
         # 手动运行时非提权 -> runas（弹一次 UAC）。程序自带 pyuac，双保险一致。
         if self._is_admin():
-            subprocess.Popen([str(EXE), "main"], cwd=str(M7A_DIR))
+            # CREATE_NO_WINDOW：别弹黑窗口（GUI 程序本来也不该有控制台，
+            # 但 2026-11-09 的绝区零就是被"冒出来的控制台被关掉"以 0xC000013A 打死的，统一处理）
+            subprocess.Popen([str(EXE), "main"], cwd=str(M7A_DIR),
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             log.info("[March7th] 管理员上下文中直接启动（无 UAC）")
         else:
             ctypes.windll.shell32.ShellExecuteW(None, "runas", str(EXE), "main", str(M7A_DIR), 1)
@@ -174,13 +278,39 @@ class StarRailAdapter:
                            capture_output=True, text=True)
         return "March7th Assistant.exe" in r.stdout
 
-    def wait(self, timeout_s: int = 7200):
+    def wait(self, timeout_s: int = 3600):
+        """等三月七跑完：进程退出=完成；但"必死错误"和"日志停长"要立刻收工。
+
+        2026-11-09 之前这里只会死等进程退出，于是登录过期的那次白挂了 29 分钟。"""
         end = time.time() + timeout_s
+        stall_s = float(self.cfg.get("stall_minutes", 15)) * 60
+        last_size = _log_size()
+        last_progress = time.time()
         while time.time() < end:
             if not self._running():
                 _scan_today_log()   # 进程退出 ≠ 干完了：把"没干完"的痕迹写进 daily.log
                 return True   # 进程退出 = 完成（after_finish=Exit）
+            hit = _fatal_hit(_log_text_after(self._base))
+            if hit:
+                log.error("[March7th] 引擎报致命错误『%s』—— 判定失败并立即结束进程"
+                          "（不再干等超时，免得把后面的游戏挤掉）", hit)
+                if "登录过期" in hit:
+                    log.error("[March7th] %s", M7A_FATAL_HINT)
+                _scan_today_log()
+                self.stop()
+                return False
+            size = _log_size()
+            if size != last_size:
+                last_size = size
+                last_progress = time.time()
+            elif time.time() - last_progress > stall_s:
+                log.error("[March7th] 日志已 %.0f 分钟没有增长，引擎卡死 —— 结束它并判失败",
+                          (time.time() - last_progress) / 60)
+                _scan_today_log()
+                self.stop()
+                return False
             time.sleep(10)
+        log.error("[March7th] 等待超时（%d 分钟），判定失败", timeout_s // 60)
         return False
 
     def stop(self):

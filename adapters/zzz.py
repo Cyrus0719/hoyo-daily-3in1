@@ -27,7 +27,60 @@ ONE_DRAGON_DIR = Path(os.environ.get("HOYO_ONEDRAGON_DIR") or (BASE / "OneDragon
 LAUNCHER = ONE_DRAGON_DIR / "src" / "zzz_od" / "application" / "zzz_application_launcher.py"
 PY = ONE_DRAGON_DIR / ".venv" / "Scripts" / "python.exe"
 OD_LOG = ONE_DRAGON_DIR / ".log" / "log.txt"
+CLI_LOG = BASE / "logs" / "zzz_cli.log"
 INSTANCE = "1"
+
+# 2026-11-13：绝区零的成败不能只看退出码 —— 今天 OneDragon 内部因为
+#   「未获取到游戏截图 / 游戏窗口未找到」整条龙都没跑，退出码却是 0，
+#   我们照样报了 ok=True（跟 BetterGI 那类假成功一个毛病）。
+# 一次完整的成功运行，日志里一定有「执行成功 返回状态 全部结束」。
+ZZZ_OK_MARK = "全部结束"
+ZZZ_FAIL_PATTERNS = (
+    "未获取到游戏截图",        # 游戏窗口在，但截不到图（窗口正在重建/启动中）
+    "游戏窗口未找到",          # 截图时窗口句柄没了
+    "执行出错",
+    "暂停启动",
+    "未配置账号密码",          # OneDragon 的账号密码登录没配（掉登录时走不通）
+    "返回状态 异常",
+)
+
+
+def _cli_log_size() -> int:
+    try:
+        return CLI_LOG.stat().st_size
+    except Exception:
+        return 0
+
+
+def _cli_text_after(base: int) -> str:
+    """读本次运行新增的 OneDragon 日志（文件是 GBK）。"""
+    try:
+        with open(CLI_LOG, "rb") as fp:
+            fp.seek(base if base >= 0 else 0)
+            return fp.read().decode("gbk", errors="replace")
+    except Exception:
+        return ""
+
+
+def _finish_check(base: int) -> bool:
+    """退出码 0 也要看日志：有没有失败特征、有没有跑到「全部结束」。"""
+    text = _cli_text_after(base)
+    if not text.strip():
+        log.error("[zzz] OneDragon 这次日志一行没写 —— 判定为启动阶段崩溃")
+        return False
+    hits = {}
+    for p in ZZZ_FAIL_PATTERNS:
+        n = text.count(p)
+        if n:
+            hits[p] = n
+    if hits:
+        log.error("[zzz] OneDragon 日志有失败特征（本次没跑完）: %s", hits)
+        return False
+    if ZZZ_OK_MARK not in text:
+        log.error("[zzz] OneDragon 退出码是 0，但日志里没有「%s」—— 判定没跑完", ZZZ_OK_MARK)
+        return False
+    log.info("[zzz] 日志检查通过：跑到「%s」且无失败特征", ZZZ_OK_MARK)
+    return True
 
 
 def _run(cmd):
@@ -82,6 +135,19 @@ def _ensure_background_mode():
 PROFILE_DIR = BASE / "config" / "zzz_display_profiles"
 LS_SUBPATH = Path("ZenlessZoneZero_Data") / "Persistent" / "LocalStorage"
 
+# 2026-11-13：档里除了显示设置（GENERAL_DATA.bin）还混进了 USD_*.bin —— 那是账号/UID
+# 相关的本地存储。此前 swap 不分青红皂白全量 copy2 回游戏目录，等于每跑一次就把很久以前
+# 的账号档盖回游戏，用户体感就是"绝区零经常让我重新登录"。现在只回写显示设置，
+# 账号类文件一概不挪不写（游戏自己维护）。
+_NEVER_COPY_PREFIX = ("USD_",)
+
+
+def _is_display_file(p: Path) -> bool:
+    """只认显示设置文件；账号/UID 相关（USD_*）永远不参与挪移和回写。"""
+    if not p.is_file() or p.suffix != ".bin":
+        return False
+    return not any(p.name.upper().startswith(k) for k in _NEVER_COPY_PREFIX)
+
 
 def _game_localstorage(cfg: dict):
     client = (cfg or {}).get("client_path") or ""
@@ -104,7 +170,7 @@ def stash_game_settings(cfg: dict) -> bool:
     stash.mkdir(parents=True, exist_ok=True)
     n = 0
     for f in sorted(dst.iterdir()):
-        if f.is_file() and f.suffix == ".bin":
+        if _is_display_file(f):
             shutil.move(str(f), str(stash / f.name))
             n += 1
     log.info("[zzz] 已把游戏显示设置挪走 %d 个文件（本次将回退用注册表的窗口化设置）", n)
@@ -127,7 +193,7 @@ def swap_display_profile(cfg: dict, name: str) -> bool:
         return False
     n = 0
     for f in src.iterdir():
-        if f.is_file() and f.suffix != ".json":
+        if _is_display_file(f):
             shutil.copy2(f, dst / f.name)
             n += 1
     # 注册表也按这份档写（这份档是"游戏自己写出来的值"，照抄最保险）
@@ -155,6 +221,15 @@ def _tail_od_log(max_bytes: int = 20000) -> str:
         return ""
 
 
+# 2026-11-09 事故补丁：OneDragon CLI 启动 2.2 秒就以 0xC000013A(STATUS_CONTROL_C_EXIT) 退出，
+#   而且连 log.txt / zzz_cli.log 都没有一行输出 —— 典型的"控制台被中断/被关掉"。
+#   父进程是 pythonw（没有控制台），子进程 python.exe 会自己开一个新控制台窗口；
+#   开出来的黑窗口被关掉（或被别的控制台事件带上）就是这个退出码。
+#   所以：给它一个不可见的独立控制台 + 独立进程组（不接收父进程的 Ctrl+C 广播）+ stdin 置空。
+_NO_WINDOW_FLAGS = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
 def _in_login_loop() -> bool:
     """OneDragon 是否还卡在"点击进入游戏"循环（=游戏仍在登录页）。"""
     tail = _tail_od_log()
@@ -171,6 +246,9 @@ class ZZZAdapter:
         self.targets = [t for t in targets if t.get("enabled", True)]
         self.proc = None
         self._guard = None
+        self._cli_log = subprocess.DEVNULL
+        self._t0 = 0.0
+        self._log_base = 0
 
     def start(self):
         if not LAUNCHER.exists() or not PY.exists():
@@ -200,20 +278,27 @@ class ZZZAdapter:
             self._cli_log = open(log_dir / "zzz_cli.log", "ab", buffering=0)
         except Exception:
             self._cli_log = subprocess.DEVNULL
-        self.proc = subprocess.Popen(args, cwd=str(ONE_DRAGON_DIR), env=env,
-                                     stdout=self._cli_log, stderr=subprocess.STDOUT)
+        self._spawn(env, args)
         # 窗口兜底：整场盯着游戏窗口。实测绝区零会"先窗口化、进游戏后自己切回全屏"，
         # 所以必须一直盯（修一次就收工会漏掉后面这次切换，引擎就全线识别失败）。
         self._guard = win_guard.watch_async("zzz")
         # 前台模式下 OneDragon 自行完成"点击进入游戏"（用户实测可用，无需任何虚拟手柄）
 
-    def wait(self, timeout_s: int) -> bool:
+    def _spawn(self, env, args):
+        self._log_base = _cli_log_size()   # 只看本次运行新写的日志
+        self.proc = subprocess.Popen(args, cwd=str(ONE_DRAGON_DIR), env=env,
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=self._cli_log, stderr=subprocess.STDOUT,
+                                     creationflags=_NO_WINDOW_FLAGS)
+        self._t0 = time.time()
+
+    def _wait_once(self, timeout_s: int) -> bool:
         if self.proc is None:
             return False
         try:
             self.proc.wait(timeout=timeout_s)
             code = self.proc.returncode
-            log.info("[zzz] OneDragon 退出 code=%s", code)
+            log.info("[zzz] OneDragon 退出 code=%s（本次耗时 %.1f 秒）", code, time.time() - self._t0)
             if code != 0:
                 # 2026-09-13：CLI 以 0xC000013A 退出（识别失败后自己中止），旧代码一律当成功上报
                 log.error("[zzz] OneDragon 非正常退出（code=%s），本次判定为失败", code)
@@ -222,6 +307,45 @@ class ZZZAdapter:
         except subprocess.TimeoutExpired:
             log.warning("[zzz] OneDragon 超时(%ss)，终止", timeout_s)
             return False
+
+    def wait(self, timeout_s: int) -> bool:
+        """等 OneDragon CLI 跑完，并按日志判定成败；3 分钟内收工就重试一次。
+
+        两处坑（都实测过）：
+          · 退出码不可信：今天内部因为「未获取到游戏截图」直接暂停启动，退出码却是 0；
+          · 启动阶段失败（窗口还没建好就去截图）是瞬时故障，重来一趟通常就好了。"""
+        if self.proc is None:
+            return False
+        ok = self._wait_once(timeout_s)
+        if ok:
+            ok = _finish_check(self._log_base)
+        if ok:
+            return True
+        elapsed = time.time() - self._t0
+        if elapsed >= 180:
+            return False
+        tail = _tail_od_log(4000).strip()
+        log.warning("[zzz] 启动后仅 %.1f 秒就收工，判定为启动阶段失败，重试一次", elapsed)
+        if tail:
+            log.warning("[zzz] OneDragon 日志尾部: %s", tail[-1200:])
+        # 重试前把游戏清干净、窗口档重新铺一遍（否则第二趟会撞上同一个坏窗口）
+        _run(["taskkill", "/IM", "ZenlessZoneZero.exe", "/F"])
+        for _ in range(20):
+            r = _run(["tasklist", "/FI", "IMAGENAME eq ZenlessZoneZero.exe"])
+            if b"ZenlessZoneZero.exe" not in r.stdout:
+                break
+            time.sleep(1)
+        swap_display_profile(self.cfg, "windowed")
+        time.sleep(5)
+        env = os.environ.copy()
+        proxy = (os.environ.get("HOYO_PROXY") or self.cfg.get("proxy") or "").strip()
+        if proxy:
+            env["HTTP_PROXY"] = proxy
+            env["HTTPS_PROXY"] = proxy
+        self._spawn(env, [str(PY), str(LAUNCHER), "-c", "-i", INSTANCE])
+        if not self._wait_once(timeout_s):
+            return False
+        return _finish_check(self._log_base)
 
     def after_kill(self):
         """auto_daily 在"游戏已彻底退出"之后调用：换回用户自己的显示档（全屏）。"""

@@ -231,6 +231,39 @@ def _sync_task_time(sched: dict) -> None:
         log.warning("计划任务时间对齐异常: %s", e)
 
 
+def _uptime_minutes() -> float:
+    """开机到现在多少分钟（GetTickCount64，毫秒，不需要额外依赖）。"""
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetTickCount64() / 60000.0
+    except Exception:
+        return 9999.0
+
+
+def _boot_guard(sched: dict) -> None:
+    """开机太早不要跑：2026-11-09 就是 07:00:43 开机、07:10 计划任务就触发，
+    第一次启动原神花了 6 分钟才到登录页 → BetterGI 等不到主界面、自己把游戏杀掉重开
+    → 一条龙被取消、树脂 0 消耗（日志里还没有任何旧失败特征，于是报成了 ok=True）。
+    开机不满 min_uptime_minutes 就先等一会儿，让开机那一波磁盘/网络 IO 忙完再进游戏。"""
+    need = sched.get("min_uptime_minutes", 6)
+    cap = sched.get("boot_wait_max_minutes", 15)
+    # 注意别用 or：0 是合法值（= 不等待）
+    need = 6.0 if need is None else float(need)
+    cap = 15.0 if cap is None else float(cap)
+    up = _uptime_minutes()
+    if need <= 0 or up >= need:
+        log.info("开机已 %.1f 分钟（要求 ≥ %.0f 分钟），直接开始", up, need)
+        return
+    wait_s = min((need - up) * 60.0, cap * 60.0)
+    log.warning("开机只有 %.1f 分钟（要求 ≥ %.0f 分钟）：先等 %.0f 秒，"
+                "避免游戏冷启动太慢、把引擎拖到超时", up, need, wait_s)
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        time.sleep(min(15.0, max(1.0, wait_s)))
+        log.info("等待开机稳定中… 已等 %.0f 秒（开机 %.1f 分钟）", time.time() - t0, _uptime_minutes())
+    log.info("开机稳定等待结束（开机 %.1f 分钟），开始跑游戏", _uptime_minutes())
+
+
 def _main_inner():
     cfg = load_config()
     sched = cfg.get("scheduler", {})
@@ -245,6 +278,10 @@ def _main_inner():
     else:
         dry = False
         games = order
+    if not dry and len(sys.argv) < 2:
+        # 只在"计划任务整轮跑"时等开机稳定；手动单跑某款游戏（python auto_daily.py genshin）不等，
+        # 否则用户手动调试还得干站 6 分钟。
+        _boot_guard(sched)
     results = {}
     for game_key in games:
         results[game_key] = run_game(game_key, cfg.get("games", {}), dry_run=dry)

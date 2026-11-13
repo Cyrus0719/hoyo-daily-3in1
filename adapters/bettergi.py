@@ -40,6 +40,28 @@ LOG_DIR = BETTERGI_DIR / "log"
 ONE_DRAGON_CONFIG = ONEDRAGON_DIR / "daily.json"   # 固定配置名：可编辑、不删除
 COMPLETE_MARK = "一条龙和配置组任务结束"
 
+# ── 战斗脚本自动补全（2026-11-13 定案）────────────────────────────────
+# 「站在那里挨打」的根因：战斗脚本不认识队伍里的角色。
+#   BetterGI 的逻辑（GameTask/AutoFight/Script/CombatScriptBag.cs::SelectCombatScript）：
+#   把 User/AutoFight 下所有 .txt 逐份与队伍角色取交集，匹配人数最多的那份胜出，
+#   【一个都不匹配就 throw "未匹配到任何战斗脚本"】→ AutoFight 一次按键都不发 = 站桩挨打
+#   → "战斗失败，重新寻找地脉花" → 多轮后 "已达最大重试次数" → 整轮白跑、树脂没花。
+#   本机 AutoFight 目录里只有一份 8 月下载的「万能战斗策略（萌新推荐）」（43 个角色），
+#   队伍换成它没收录的新角色（桑多涅/薇斯纳/沃雅妮莎/尼可）就零命中。
+#   我们不碰用户/群友的脚本：自己维护一份补全文件，把日志里出现过但谁都不认识的角色
+#   按通用连招补一行，下一次一条龙就能匹配上（匹配人数少也不会抢走群友那份）。
+AUTOFIGHT_DIR = BETTERGI_DIR / "User" / "AutoFight"
+FALLBACK_SCRIPT = AUTOFIGHT_DIR / "自动补全.txt"
+FALLBACK_HEADER = (
+    "// 由 hoyo-daily-3in1 自动维护：把「队伍里有、但所有战斗脚本都不认识」的角色补一条通用连招。" + chr(10) +
+    "// 只求别让 BetterGI 抛「未匹配到任何战斗脚本」站桩挨打；有正式策略后可整份删掉。" + chr(10)
+)
+_TEAM_RE = re.compile(r'识别到的队伍角色[:：]\s*"([^"]+)"')
+# 本次运行里"补全脚本"新增了哪些角色（_should_retry 用它判断该不该立刻再跑一趟）
+_HEAL_ADDED = []
+
+GENERIC_COMBAT = "e, attack(0.3), check, wait(0.3), keypress(q), wait(0.1), ready, check, wait(0.3)"
+
 
 def _is_admin() -> bool:
     try:
@@ -48,14 +70,18 @@ def _is_admin() -> bool:
         return False
 
 
-def _launch(exe: Path, args: str, cwd: Path) -> None:
-    """提权感知启动：已是管理员直接启动（无 UAC），否则 runas（弹一次 UAC）。"""
+def _launch(exe: Path, args: str, cwd: Path):
+    """提权感知启动：已是管理员直接启动（无 UAC），否则 runas（弹一次 UAC）。
+
+    返回 Popen（只有管理员直启才有）；调用方拿它取退出码 —— 早退时退出码能区分
+    "被系统杀掉/崩掉" 和 "引擎自己决定收工"（2026-11-13 起记录，以前什么都没留下）。"""
     if _is_admin():
-        subprocess.Popen([str(exe), args], cwd=str(cwd))
+        proc = subprocess.Popen([str(exe), args], cwd=str(cwd))
         log.info("[BetterGI] 管理员上下文中直接启动（无 UAC）")
-    else:
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", str(exe), args, str(cwd), 1)
-        log.info("[BetterGI] 非提权上下文 runas 启动 rc=%s（UAC 一次，>32=成功）", rc)
+        return proc
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", str(exe), args, str(cwd), 1)
+    log.info("[BetterGI] 非提权上下文 runas 启动 rc=%s（UAC 一次，>32=成功）", rc)
+    return None
 
 
 def kill_bettergi_if_running():
@@ -63,18 +89,38 @@ def kill_bettergi_if_running():
     time.sleep(1)
 
 
-def kill_game_if_running(client_path: str = "") -> None:
-    """关掉原神客户端并等它彻底退出（让 BetterGI 自己走"打开游戏 → 进游戏"的完整流程）。"""
-    exe = Path(client_path).name if client_path else "YuanShen.exe"
+def _close_game(exe: str, grace_s: int = 8) -> bool:
+    """先礼后兵地关掉游戏：先发 WM_CLOSE（taskkill 不带 /F），等一段时间；还在才硬杀。
+
+    2026-11-13：以前一律 /F 硬杀。硬杀时游戏来不及回写自己的设置/登录态，
+    半途被打死的客户端也更容易留下坏档（"经常要求重新登录"的可疑因素之一），
+    能正常关就先正常关。返回 True 表示进程已经退出。"""
     try:
-        _run_hidden(["taskkill", "/IM", exe, "/F"], capture_output=True)
-        for _ in range(30):
-            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe], capture_output=True, text=True)
+        _run_hidden(["taskkill", "/IM", exe], capture_output=True)     # 礼貌：WM_CLOSE
+        for _ in range(grace_s):
+            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
+                            capture_output=True, text=True)
             if exe.lower() not in (r.stdout or "").lower():
-                return
+                log.info("[BetterGI] %s 已正常退出", exe)
+                return True
+            time.sleep(1)
+        log.warning("[BetterGI] %s 没有正常退出，改用强制结束", exe)
+        _run_hidden(["taskkill", "/IM", exe, "/F"], capture_output=True)
+        for _ in range(20):
+            r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq " + exe],
+                            capture_output=True, text=True)
+            if exe.lower() not in (r.stdout or "").lower():
+                return True
             time.sleep(1)
     except Exception as e:
         log.warning("[BetterGI] 关闭游戏失败: %s", e)
+    return False
+
+
+def kill_game_if_running(client_path: str = "") -> None:
+    """关掉原神客户端并等它彻底退出（让 BetterGI 自己走"打开游戏 → 进游戏"的完整流程）。"""
+    exe = Path(client_path).name if client_path else "YuanShen.exe"
+    _close_game(exe)
 
 
 LEYLINE_ASSET = BETTERGI_DIR / "GameTask" / "AutoLeyLineOutcrop" / "Assets" / "config.json"
@@ -282,8 +328,17 @@ def _tail_text(f, max_bytes: int = 300_000) -> str:
 # 2026-10-14 补：内部任务失败的真实文案是 "自动地脉花执行失败" / "自动秘境执行失败"
 #   （异常类型是 System.Exception，文案里是"执行失败"不是"执行异常"），
 #   旧清单漏了它，于是 10-14 地脉花只打了 2 次就挂、daily.log 仍报"无失败特征"+ok=True。
+# 2026-11-09 补：当天冷启动（07:00:43 开机、07:10 就跑）原神第一次启动极慢，
+#   BetterGI 等不到主界面 → 自己把游戏杀掉重开 → 一条龙被取消。当天日志里【没有】任何旧特征，
+#   于是 daily.log 又写了"日志检查通过"+ok=True，实际树脂 0 消耗、邮件以外一件没做。
+#   新增："任务被取消"、"A task was canceled"（一条龙被中止的原文）、"请先启动BetterGI"（引擎崩掉的原味）。
 FAIL_PATTERNS = ("游戏窗口分辨率不是 16:9", "识别出战角色失败", "任务启动失败",
-                 "执行异常", "执行失败", "已达最大重试次数")
+                 "执行异常", "执行失败", "已达最大重试次数",
+                 "任务被取消", "A task was canceled", "请先启动BetterGI",
+                 # 2026-11-13：队伍里没有任何一个角色被任何战斗脚本认识时，AutoFight 直接抛这句，
+                 # 一个键都不按 = 站在那里挨打。补全脚本（自动补全.txt）会在本次之后自动写，
+                 # 但这一趟仍必须判失败，否则又变成"引擎退出就是 ok"的假成功。
+                 "未匹配到任何战斗脚本")
 
 # 非致命但值得盯的"退化"特征：命中只 WARNING，不判失败。
 # "放弃此路径点" 是 至冬 地脉花寻路出问题的强信号（历史上只在 10-14 出现过 4 次，
@@ -322,6 +377,15 @@ def _stygian_ran(text: str) -> bool:
 
 
 _LOG_BASE = {"name": "", "size": 0}
+
+
+def _log_size() -> int:
+    """当前最新日志文件的字节数（给"卡死看门狗"判断引擎还有没有在动）。"""
+    try:
+        f = sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[0]
+        return f.stat().st_size
+    except Exception:
+        return 0
 
 
 def _log_baseline() -> None:
@@ -420,6 +484,120 @@ def _log_has_mark() -> bool:
     return COMPLETE_MARK in _new_log_text()
 
 
+def _should_retry() -> bool:
+    """第一趟没跑完时，值不值得再跑一趟？
+
+    只在"确实早死"的形态下重试，避免正常跑完但日志里没找到标记时白跑第二趟（还可能多花树脂）：
+      · 本次日志一个字都没写  → 引擎压根没起来
+      · 出现"任务被取消/A task was canceled/游戏已退出/请先启动BetterGI" → 早死（11-09 的形态）
+      · 日志里没有任何"任务启动"记录 → 空转
+    """
+    text = _new_log_text()
+    if not text.strip():
+        return True
+    # 注意顺序：BetterGI 即使某个任务失败，也照样会写「一条龙和配置组任务结束」，
+    # 所以这两个判断必须在 COMPLETE_MARK 之前。
+    if "未匹配到任何战斗脚本" in text and _HEAL_ADDED:
+        # 2026-11-13：「未匹配到任何战斗脚本」= 站桩挨打的根因
+        # （AutoFight 找不到脚本，一次按键都不发）。这次已经补好脚本，
+        # 立刻再跑一趟才可能真的打起来，否则这轮树脂还是白花。
+        log.info("[BetterGI] 这次缺的战斗脚本已补好，重新跑一趟")
+        return True
+    if COMPLETE_MARK in text:
+        return False
+    for p in ("任务被取消", "A task was canceled", "游戏已退出", "请先启动BetterGI"):
+        if p in text:
+            return True
+    return ("任务启动" not in text) and ("开始执行" not in text)
+
+
+
+def _script_avatar_names(path: Path) -> set:
+    """一份战斗脚本里出现过的角色名（每行第一个空格前的内容，跳过注释）。"""
+    names = set()
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s or s.startswith("//") or s.startswith("#"):
+                continue
+            head = re.split(r"[ (]", s, maxsplit=1)[0].strip()
+            if head:
+                names.add(head)
+    except Exception:
+        pass
+    return names
+
+
+def _known_script_names() -> set:
+    """User/AutoFight 下【别人写的】脚本认识哪些角色（不含我们自己的补全文件）。"""
+    names = set()
+    if AUTOFIGHT_DIR.is_dir():
+        for p in AUTOFIGHT_DIR.rglob("*.txt"):
+            try:
+                if p.resolve() == FALLBACK_SCRIPT.resolve():
+                    continue
+            except Exception:
+                pass
+            names |= _script_avatar_names(p)
+    return names
+
+
+def _team_names_from_log(text: str) -> list:
+    """日志里引擎自己报的「识别到的队伍角色」，按出现顺序去重。"""
+    out = []
+    for m in _TEAM_RE.finditer(text or ""):
+        for n in re.split(r"[,，]", m.group(1)):
+            n = n.strip()
+            if n and n not in out:
+                out.append(n)
+    return out
+
+
+def _append_fallback(names: list) -> list:
+    """把不认识的角色按通用连招补一行进我们自己的补全脚本，返回真正补进去的名字。"""
+    if not names:
+        return []
+    try:
+        AUTOFIGHT_DIR.mkdir(parents=True, exist_ok=True)
+        existed = FALLBACK_SCRIPT.exists()
+        known = _script_avatar_names(FALLBACK_SCRIPT) if existed else set()
+        todo = [n for n in names if n and n not in known]
+        if not todo:
+            return []
+        with open(FALLBACK_SCRIPT, "a", encoding="utf-8") as fp:
+            if not existed:
+                fp.write(FALLBACK_HEADER)
+            for n in todo:
+                fp.write("%s %s\n" % (n, GENERIC_COMBAT))
+        return todo
+    except Exception as e:
+        log.warning("[BetterGI] 写战斗脚本补全文件失败: %s", e)
+        return []
+
+
+def _heal_combat_script(text: str = "") -> None:
+    """日志里出现了「脚本不认识的角色」就自动补全 —— 下次一条龙就能匹配上。
+
+    只在真有人不认识时才写文件；用户/群友那份脚本一个字都不动。"""
+    text = text or _new_log_text()
+    if not text:
+        return
+    teams = _team_names_from_log(text)
+    if not teams:
+        return
+    known = _known_script_names()
+    missing = [n for n in teams if n not in known]
+    if not missing:
+        return
+    added = _append_fallback(missing)
+    if added:
+        global _HEAL_ADDED
+        _HEAL_ADDED = list(added)
+        log.warning("[BetterGI] 战斗脚本不认识这些角色 → 已把通用连招补进 %s: %s"
+                    "（打完这一趟就能一直匹配；「站在那里挨打」就是缺这个）",
+                    FALLBACK_SCRIPT.name, "/".join(added))
+
+
 class BetterGIAdapter:
     """原神适配器：多个目标按顺序各自跑一条龙（共享常驻配置 daily.json，逐目标改任务）。"""
 
@@ -436,6 +614,7 @@ class BetterGIAdapter:
         self.finished = False
         self.failed = False
         self._guard = None
+        self._last_elapsed = 0.0   # 上一趟跑了多少秒（用来识别"10 秒就收工"的早退）
 
     def _run_one_dragon(self, target: dict, timeout_s: int, idx: int, override: dict = None) -> None:
         """起一趟一条龙并等它跑完。"""
@@ -443,15 +622,31 @@ class BetterGIAdapter:
                                           switch_override=override)
         name = cfg_path.stem
         log.info("[BetterGI] 启动一条龙配置 %s（秘境=%s）", name, target["name"])
-        _launch(BETTERGI_EXE, f"startOneDragon {name}", BETTERGI_DIR)
+        t0 = time.time()
+        self.proc = _launch(BETTERGI_EXE, f"startOneDragon {name}", BETTERGI_DIR)
         # 窗口兜底：整场盯着游戏窗口（只起一次，多趟复用同一个监视线程）
         if self._guard is None:
             self._guard = win_guard.watch_async("genshin")
-        if not self._wait_exit(timeout_s=timeout_s):
+        ok = self._wait_exit(timeout_s=timeout_s)
+        self._last_elapsed = time.time() - t0
+        code = self.proc.poll() if self.proc is not None else None
+        if code is not None:
+            log.info("[BetterGI] 引擎退出码 %s（本趟耗时 %.1f 秒）", code, self._last_elapsed)
+        if not ok:
             log.error("[BetterGI] 配置 %s 超时（本次视为失败，别再报 ok=True）", name)
+            self.failed = True
+        elif self._last_elapsed < 120 and not _log_has_mark():
+            # 2026-11-13：正常一轮 4 个任务要 8 分钟以上。两分钟内就退出、又没完成标记，
+            #   只能是「启动游戏」阶段自己收工（冷启动进主界面太慢 / 上一轮游戏没退干净）。
+            log.error("[BetterGI] 这一趟只跑了 %.0f 秒就退出、也没有完成标记 —— 引擎在"
+                      "「启动游戏」阶段就收工了，本次按没跑完处理（随后会重试一趟）",
+                      self._last_elapsed)
             self.failed = True
 
     def start(self):
+        # 每次运行都重置「这次补全过哪些角色」，别让上一次的残留影响这次的重试判断
+        global _HEAL_ADDED
+        _HEAL_ADDED = []
         kill_bettergi_if_running()   # 保证单实例（startOneDragon 参数走激活流程）
         kill_game_if_running(self.cfg.get("client_path", ""))   # 先关游戏：让它自己从登录界面进游戏，
                                      # 否则用户把游戏停在某个界面时 BetterGI 会一直等（实测 10/3-10/5 空等一小时）
@@ -467,6 +662,22 @@ class BetterGIAdapter:
         # ※ 曾为了"树脂全给危战"拆成两趟（第二趟重开游戏），10/10 实测第二趟进至冬秘境按 F 之后
         #   BetterGI 直接没了、树脂一点没花 —— 换新游戏会话风险太大，回退单趟。
         self._run_one_dragon(t, timeout_s, 0, None)
+        # 【重试一次】第一趟没跑完（没有完成标记）通常发生在"开机后第一次启动游戏特别慢"
+        #   或者引擎自己把游戏杀掉重开的时候。2026-11-09 就是：07:00 开机、07:10 就跑，
+        #   第一次启动原神花了 6 分钟才到登录页 → BetterGI 等不到主界面、主动杀游戏 ->
+        #   一条龙被取消、树脂 0 消耗。第二趟游戏已经在系统缓存里"热"了（当天实测 40 秒进世界）。
+        #   只重试一次，避免无限循环。
+        # 早退（< 3 分钟就自己收工）也算"值得重试"：2026-11-13 那两趟分别只活了 10 秒和 1.4 秒，
+        #   日志里一个失败特征都没留下，_should_retry() 看不出来，于是只跑一趟就放弃了。
+        if self.failed and (_should_retry() or self._last_elapsed < 180):
+            log.warning("[BetterGI] 第一趟没有跑完（耗时 %.0f 秒），准备重试一次"
+                        "（先杀干净引擎和游戏，等它彻底退出，重置日志基线）", self._last_elapsed)
+            kill_bettergi_if_running()
+            kill_game_if_running(self.cfg.get("client_path", ""))
+            time.sleep(15)   # 8 秒时游戏进程/文件锁常常还没退干净，第二趟会秒退
+            _log_baseline()
+            self.failed = False
+            self._run_one_dragon(t, timeout_s, 1, None)
         # 【不删除】daily.json 常驻，用户可在 BetterGI UI 中直接编辑
         self.finished = True
 
@@ -485,8 +696,22 @@ class BetterGIAdapter:
         kill_bettergi_if_running()
 
     def _finish_check(self) -> None:
-        """引擎退出后的收尾判定：日志里有失败特征就把本次判为失败（不再是 ok=True）。"""
+        """引擎退出后的收尾判定：日志里有失败特征就把本次判为失败（不再是 ok=True）。
+
+        2026-11-09 补：光看"失败特征"会漏判 —— 当天一条龙被取消、树脂 0 消耗，
+        日志里一条旧特征都没有，于是被报成 ok=True。反过来验：整轮跑完必然会打
+        完成标记『一条龙和配置组任务结束』，没有它 = 这轮根本没跑完。"""
         if _report_log_failures():
+            self.failed = True
+        # 顺手补全战斗脚本：日志里出现「脚本不认识的角色」时把通用连招写进去，
+        # 下一次一条龙就能匹配上（「站在那里挨打」的根治点，见文件顶部说明）。
+        try:
+            _heal_combat_script()
+        except Exception as e:
+            log.warning("[BetterGI] 战斗脚本自动补全出错: %s", e)
+        if not _log_has_mark():
+            log.error("[BetterGI] 本次日志里没有完成标记『%s』—— 整轮任务没有跑完"
+                      "（多半是游戏/引擎中途退出或被取消）", COMPLETE_MARK)
             self.failed = True
 
     def _wait_exit(self, timeout_s: int) -> bool:
@@ -501,6 +726,11 @@ class BetterGIAdapter:
         start = time.time()
         seen = False
         last_report = 0.0
+        # 卡死看门狗：引擎进程还在，但日志 10 分钟没有新字节 = 已经卡死（正常跑时日志几乎每秒都在写）。
+        # 11-09 崩铁就是这种形态：引擎不退出、活活挂了 27 分钟，把后面的绝区零挤掉。
+        stall_s = float(self.cfg.get("stall_minutes", 10)) * 60
+        last_size = _log_size()
+        last_progress = time.time()
         while time.time() < end:
             running = _running()
             if running:
@@ -520,6 +750,16 @@ class BetterGIAdapter:
                 self._finish_check()
                 return True
             now = time.time()
+            size = _log_size()
+            if size != last_size:
+                last_size = size
+                last_progress = now
+            elif seen and now - last_progress > stall_s:
+                log.error("[BetterGI] 引擎进程还在，但日志已经 %.0f 分钟没有增长 —— 判定卡死，"
+                          "杀掉引擎结束本次（不再白等超时）", (now - last_progress) / 60)
+                self.failed = True
+                kill_bettergi_if_running()
+                return False
             if now - last_report > 30:
                 last_report = now
                 log.info("[BetterGI] 等待引擎完成中… seen=%s", seen)
