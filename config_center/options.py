@@ -49,6 +49,45 @@ def clear_cache():
     _CACHE.clear()
 
 
+# --------------------------------------------------------------------------- 崩铁字段中文名
+# March7th 的 assets/config/config.example.yaml 每个键后面都写了中文注释（上游自己写的），
+# 直接拿它当字段名和说明 —— 323 个键全部有中文，不用手写白名单。
+_M7A_EXAMPLE = M7A / "assets" / "config" / "config.example.yaml"
+_RE_YAML_KV = re.compile(r"^(\s*)([A-Za-z_][\w]*):(.*)$")
+
+
+def _m7a_comment_meta():
+    """({key: 中文名}, {key: 说明})，从 config.example.yaml 的行内注释里取。"""
+    labels, helps = {}, {}
+    try:
+        text = _M7A_EXAMPLE.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return labels, helps
+    for line in text.splitlines():
+        m = _RE_YAML_KV.match(line)
+        if not m:
+            continue
+        key, rest = m.group(2), m.group(3)
+        if "#" not in rest:
+            continue
+        cmt = rest.split("#", 1)[1].strip()
+        if not cmt:
+            continue
+        helps[key] = cmt
+        lab = re.split(r"[。；;]|，?可选值|，?取值范围|，?默认", cmt)[0].strip(" ，,。")
+        if not lab:
+            lab = cmt
+        if len(lab) > 26:
+            lab = re.split(r"[，,]", lab)[0][:26]
+        labels[key] = lab
+    return labels, helps
+
+
+def m7a_key_meta():
+    """带缓存的 ({key: 中文名}, {key: 说明})。"""
+    return _cached("m7a_key_meta", _m7a_comment_meta, ttl=300) or ({}, {})
+
+
 # --------------------------------------------------------------------------- 原神
 _DOMAIN_GROUPS = [
     ("BlessDomain", "圣遗物秘境"),
@@ -170,8 +209,10 @@ def genshin_teams():
 
     try:
         d = json.load(open(BG / "User" / "OneDragon" / "daily.json", encoding="utf-8"))
-        for k in ("PartyName", "DailyRewardPartyName", "AutoBossTeamName"):
-            add(d.get(k))
+        # PartyName / DailyRewardPartyName / AutoBossTeamName / Monday~Sunday PartyName 全都收
+        for k, v in d.items():
+            if k.endswith(("PartyName", "TeamName")) or k in ("team", "friendshipTeam"):
+                add(v)
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -209,6 +250,12 @@ def _parse_comment_options(comment):
         return None
     m = re.search(r"(?:可选值|可选范围|可选参数)\s*(?:/\s*[^:：]*)?[:：]", comment)
     if not m:
+        # 有的注释写成「可选 "源码"（source）或 "集成"（exe）」，没有冒号
+        if re.search(r'可选\s*[\"“]', comment):
+            body0 = comment[re.search(r'可选\s*[\"“]', comment).start():]
+            paren_en0 = re.findall(r"[（(]([A-Za-z][A-Za-z0-9_\-]*)[）)]", body0)
+            if len(paren_en0) >= 2:
+                return paren_en0
         return None
     body = comment[m.end():]
     body = re.split(r"[。\n]", body)[0].strip(" 　")
@@ -306,6 +353,84 @@ def m7a_instance_detail(type_name, inst_name):
     return " · ".join(parts)
 
 
+# 崩铁：三月七的 config.yaml 是「功能前缀」命名的，这里把前缀翻成中文并排好顺序，
+# 前端按这个顺序给每个功能一张卡（开关 + 这项的全部细节项），不再手写白名单。
+_M7A_FEATURES = (
+    ("power", "清体力：体力与燃料", "后备开拓力、燃料、沉浸器合成都在这一组。"),
+    ("build_target", "培养目标", "打开后三月七按你选的培养方案自动决定刷哪个副本。"),
+    ("instance", "副本与队伍", "打哪些副本、每次打几次、用第几队、打之前是否先传送。"),
+    ("daily", "每日实训", "实训任务、姬子试用、记忆一。"),
+    ("reward", "奖励领取", "邮件、支援、委托、通行证、兑换码、成就、短信。"),
+    ("universe", "模拟宇宙", "启动方式（源码/集成）、差分宇宙还是模拟宇宙、次数、超时、GPU 加速。"),
+    ("divergent", "差分宇宙", "差分宇宙的类型、队伍，以及每日/每周完成记录。"),
+    ("weekly", "差分宇宙（周常）", "每周的差分宇宙奖励、关卡、稳定模式。"),
+    ("currencywars", "货币战争", "模式（标准/超频）、职级难度、策略、速通、遇到特殊词条是否重开。"),
+    ("echo_of_war", "历战余响", "每周一次的历战余响，以及从周几开始算。"),
+    ("forgottenhall", "忘却之庭（混沌回忆）", "关卡与两队配置。"),
+    ("purefiction", "虚构叙事", "关卡与两队配置。"),
+    ("apocalyptic", "末日幻影", "关卡与两队配置。"),
+    ("fight", "战斗细节", "战斗中买药、买零食、切队伍、地图版本。"),
+    ("activity", "活动", "巡星之礼、磐岩之隙、异界 realm、每日签到。"),
+    ("asset", "养成材料", "自塑尘脂、星轨专票/通票、光锥叠影、余烬兑换。"),
+    ("borrow", "借用支援", "借用好友的支援角色，以及借用次数。"),
+    ("merge", "沉浸器合成", "合成沉浸器与合成上限。"),
+    ("autoplot", "自动剧情", "跳过、点击、战斗检测、手机检测。"),
+    ("cloud_game", "云游戏", "云游戏开关、全屏、付费时长、排队上限。"),
+    ("browser", "浏览器（网页活动）", "用哪个浏览器、无头模式、缩放、下载镜像。"),
+    ("launcher", "启动器", "启动器路径与进程名。"),
+    ("game", "游戏进程", "游戏路径、窗口标题、进程名、启动超时。"),
+    ("update", "游戏更新", "更新方式、预下载、全量更新、下载代理。"),
+    ("auto", "自动化开关", "自动战斗检测、自动改分辨率、自动找游戏路径、自动更新。"),
+    ("use", "体力使用", "用后备开拓力、用燃料、后台截图。"),
+    ("hotkey", "快捷键", "秘技、地图、传送、自动战斗、停止任务的按键。"),
+    ("window", "窗口", "窗口位置、大小、是否记忆。"),
+    ("log", "日志", "日志级别、保留天数、悬浮窗。"),
+    ("scheduled", "定时运行", "任务链、冲突处理、失败是否继续。"),
+    ("notify", "通知", "邮件、Telegram、Matrix、Bark、Webhook 等全部通知渠道。"),
+    ("telemetry", "遥测上报", "匿名统计（可以关）。"),
+    ("genshin", "帧率解锁", "原神/星铁的帧率解锁程序路径。"),
+)
+
+# 名字前缀和功能对不上的几个键，显式归到对应功能里
+_M7A_FEATURE_EXTRA = {
+    "build_target": ("break_down_level_four_relicset",),
+    "instance": ("tp_before_instance", "calyx_golden_preference"),
+    "game": ("start_game_timeout",),
+    "auto": ("auto_update",),
+    "reward": ("home_cards",),
+}
+
+
+def m7a_features():
+    """[{prefix, name, desc, keys:[...]}] —— 每个功能一项，keys 是它名下的全部键（按 config 顺序）。
+    前端拿它给崩铁页生成「每个功能一张卡」，所以没被白名单写死的项也不会再漏。"""
+    keys_in_file = []
+    path = M7A / "config.yaml"
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or ":" not in s:
+                continue
+            k = s.split(":", 1)[0].strip()
+            if k and " " not in k and k not in keys_in_file:
+                keys_in_file.append(k)
+    taken = {}
+    for prefix, _nm, _ds in _M7A_FEATURES:
+        for k in _M7A_FEATURE_EXTRA.get(prefix, ()):
+            taken[k] = prefix
+    out = []
+    for prefix, name, desc in _M7A_FEATURES:
+        keys = []
+        for k in keys_in_file:
+            if taken.get(k, prefix) == prefix and (k == prefix or k.startswith(prefix + "_")):
+                keys.append(k)
+        for k in _M7A_FEATURE_EXTRA.get(prefix, ()):
+            if k not in keys:
+                keys.append(k)
+        if keys:
+            out.append({"prefix": prefix, "name": name, "desc": desc, "keys": keys})
+    return out
+
 # --------------------------------------------------------------------------- 绝区零
 def zzz_compendium():
     """[{tab, category, mission_types:[{name, missions:[{value,label}]}]}]"""
@@ -400,6 +525,50 @@ def zzz_auto_battle_configs():
     return names or ["全配队通用"]
 
 
+_OD_SKIP_APPS = {"config", "envs", "push", "operation_debug", "screenshot_helper", "model",
+                "basic_game", "basic_model", "custom", "game_account", "notify", "one_dragon",
+                "standalone_app", "pip", "charge_plan"}
+
+
+def zzz_app_configs():
+    """{app_id: 配置文件的 fid} —— OneDragon 每个 app 的自有配置就是 config/01/one_dragon/<app_id>.yml。
+    文件还没生成的（上游第一次改这项才写）也列出来，界面照样能改。"""
+    d = OD / "config" / "01" / "one_dragon"
+    out = {}
+    for p in sorted(d.glob("*.yml")) if d.is_dir() else []:
+        if p.stem.startswith("_") or p.stem in _OD_SKIP_APPS:
+            continue
+        try:
+            rel = p.relative_to(BASE).as_posix()
+        except ValueError:
+            continue
+        out[p.stem] = "auto:" + rel
+    try:
+        try:
+            from . import od_schema as ODS
+        except ImportError:  # noqa: BLE001
+            import od_schema as ODS
+        for aid in ODS.apps():
+            if aid in _OD_SKIP_APPS or aid in out:
+                continue
+            out[aid] = "auto:OneDragon-ref/" + ODS.yml_rel(aid)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def zzz_app_labels():
+    """{app_id: 中文名}，给「每项功能的详细设置」当标题。"""
+    try:
+        try:
+            from . import od_schema as ODS
+        except ImportError:  # noqa: BLE001
+            import od_schema as ODS
+        return {aid: ODS.app_label(aid) for aid in ODS.apps()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 # --------------------------------------------------------------------------- 给某个配置字段找选项
 def _opt(kind, options, note=""):
     # 注意：键名用 ui 而不是 kind —— registry 的节点本来有 kind（field/group），不能被覆盖。
@@ -461,6 +630,17 @@ def for_node(fid, path, name, value):
                     continue
                 opts.append({"value": k, "label": ("%s（%s）" % (k, hint)) if hint and hint != "跳过" else k})
             return _opt("select", opts) if opts else None
+        return None
+
+    if str(fid).startswith("auto:OneDragon-ref/config/01/one_dragon/"):
+        aid = str(fid).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        try:
+            from . import od_schema as ODS
+        except ImportError:  # noqa: BLE001
+            import od_schema as ODS
+        o = ODS.options(aid).get(name)
+        if o:
+            return o
         return None
 
     if fid == "od_charge":
@@ -534,6 +714,7 @@ def payload():
             "instance_names": _cached("m7a_instance_names", m7a_instance_names) or {},
             "drops": _cached("m7a_drops", m7a_drops) or {},
             "instance_rules": _M7A_INSTANCE_RULES,
+            "features": _cached("m7a_features", m7a_features) or [],
         },
         "zzz": {
             "compendium": _cached("zzz_comp", zzz_compendium) or {},
@@ -544,6 +725,8 @@ def payload():
             "apps": _cached("zzz_apps", zzz_apps) or {},
             "categories": zzz_all_categories(),
             "mission_types": zzz_all_mission_types(),
+            "app_configs": _cached("zzz_appcfg", zzz_app_configs) or {},
+            "app_labels": zzz_app_labels(),
         },
     }
 

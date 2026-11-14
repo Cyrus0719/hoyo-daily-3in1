@@ -33,9 +33,11 @@ except Exception:  # noqa: BLE001
 try:  # 既支持 python -m config_center.server，也支持直接跑本文件
     from . import labels as L
     from . import options as OPT
+    from . import od_schema as ODS
 except ImportError:  # noqa: BLE001
     import labels as L
     import options as OPT
+    import od_schema as ODS
 
 # --------------------------------------------------------------------------- 注册表
 BG = BASE / "tools" / "BetterGI" / "BetterGI"
@@ -51,7 +53,7 @@ _SYSTEM_FILES = {"env.yml", "model.yml", "project.yml", "repository.yml",
 
 
 def _entry(fid, label, path, fmt, game, group="", secret_hints=None, readonly=None, note="", special="",
-           schema=None, order=""):
+           schema=None, order="", create_ok=False):
     return {
         "id": fid,
         "label": label,
@@ -69,6 +71,8 @@ def _entry(fid, label, path, fmt, game, group="", secret_hints=None, readonly=No
         "schema": Path(schema) if schema else None,
         # order: 该文件支持"任务顺序"编辑时的策略名
         "order": order,
+        # create_ok: 文件还不存在也允许打开/保存（上游第一次改这项时才写文件）
+        "create_ok": bool(create_ok),
     }
 
 
@@ -130,6 +134,26 @@ def _discover():
                 p.stem, p, "yaml" if p.suffix == ".yml" else "json", game,
                 group=gname, note=gtag,
             ))
+    # 绝区零：源码里定义了设置、但文件还没生成的功能（config/01/one_dragon/<app_id>.yml）
+    od_dir = OD / "config" / "01" / "one_dragon"
+    _SKIP = {"config", "envs", "push", "operation_debug", "screenshot_helper", "model",
+             "basic_game", "basic_model", "custom", "game_account", "notify", "one_dragon",
+             "standalone_app", "pip", "charge_plan"}
+    try:
+        schema_apps = ODS.apps()
+    except Exception:  # noqa: BLE001
+        schema_apps = {}
+    for aid in sorted(schema_apps):
+        if aid in _SKIP:
+            continue
+        p = od_dir / (aid + ".yml")
+        if str(p.resolve()).lower() in known:
+            continue
+        extra.append(_entry(
+            "auto:" + str(p.relative_to(BASE)).replace(os.sep, "/"),
+            ODS.app_label(aid), p, "yaml", "zzz", group="绝区零",
+            note="这个功能还没生成配置文件，改了才会写出来", create_ok=True,
+        ))
     return extra
 
 
@@ -211,16 +235,40 @@ def load_raw(fid):
     meta = get(fid)
     p = meta["path"]
     if not p.exists():
+        if meta.get("create_ok"):        # 上游配置还没生成：当成空文件，保存时创建
+            return meta, {}, ""
         raise FileNotFoundError(str(p))
     text = _read_text(p)
-    return meta, _load(meta, text), text
+    doc = _load(meta, text)
+    if doc is None and meta.get("create_ok"):
+        doc = {}
+    return meta, doc, text
+
+
+_OD_APP_PREFIX = "auto:OneDragon-ref/config/01/one_dragon/"
+
+
+def _od_app_id(fid):
+    """auto:OneDragon-ref/config/01/one_dragon/<app_id>.yml -> app_id"""
+    fid = str(fid or "")
+    if not fid.startswith(_OD_APP_PREFIX):
+        return ""
+    return fid[len(_OD_APP_PREFIX):].rsplit(".", 1)[0]
 
 
 def _schema_doc(meta):
-    """读上游自带的默认配置示例（如三月七的 config.example.yaml）。"""
+    """读上游自带的默认配置示例（如三月七的 config.example.yaml）。
+
+    绝区零每个功能没有示例文件，默认值写在源码里（@property + self.get('k', 默认)），
+    这里改读 od_schema 解析出来的默认值表，效果一样：当前文件没写的键也能在界面看到。
+    """
     sp = meta.get("schema")
     if not sp:
-        return None
+        aid = _od_app_id(meta.get("id"))
+        if not aid:
+            return None
+        sch = ODS.schema(aid)
+        return sch or None
     try:
         text = _read_text(Path(sp))
     except OSError:
@@ -262,10 +310,27 @@ def load_doc(fid):
     sch = _schema_doc(meta)
     if not sch:
         return meta, raw, text
-    merged = copy.deepcopy(raw)
+    merged = copy.deepcopy(raw) if isinstance(raw, dict) else {}
     added = _merge_defaults(merged, sch)
     meta = dict(meta)
     meta["_defaults"] = sorted(added)
+    aid = _od_app_id(fid)
+    if aid:  # 源码里的中文 docstring 当字段说明、内置表当字段名
+        klabels, helps = ODS.labels(aid)
+        if helps:
+            meta["_helps"] = dict(helps)
+        if klabels:
+            meta["_labels"] = dict(klabels)
+    if meta.get("id") == "m7a":
+        # 崩铁：上游 config.example.yaml 每个键都有中文注释，直接当字段名/说明
+        lab, hlp = OPT.m7a_key_meta()
+        labs = dict(meta.get("_labels") or {})
+        hlps = dict(meta.get("_helps") or {})
+        for k, v in lab.items():
+            labs.setdefault(k, v)
+        for k, v in hlp.items():
+            hlps.setdefault(k, v)
+        meta["_labels"], meta["_helps"] = labs, hlps
     return meta, merged, text
 
 
@@ -572,8 +637,8 @@ def _node(meta, value, path, depth=0, dset=None):
     node = {
         "kind": "field", "name": name, "path": path, "type": _type_of(value),
         "value": value, "secret": _secret(meta, path),
-        "label": L.field_label(path, name, meta["game"]),
-        "help": L.help_text(path, meta["game"]),
+        "label": (meta.get("_labels") or {}).get(path) or L.field_label(path, name, meta["game"]),
+        "help": (meta.get("_helps") or {}).get(path) or L.help_text(path, meta["game"]),
         "readonly": path in meta["readonly"] or name.lower() in ("lastupdatescriptrepotime", "runforversion"),
         # is_default: 这个键文件里还没写，值来自上游默认配置（改了就落盘）
         "is_default": bool(dset and path in dset),

@@ -263,6 +263,43 @@
     return wrap;
   }
 
+  /* 「下拉 + 自己填」：真 <select>（点开就有全部选项，不再是假的输入框箭头），
+     最后一项是「自己填一个…」，选中就切成输入框。 */
+  var CUSTOM_V = '\u0001custom';
+  function comboSelect(opts, val, dirty, onPick) {
+    var wrap = el('div', 'combo2');
+    var cur = (val === null || val === undefined) ? '' : String(val);
+    function buildInput() {
+      clear(wrap);
+      var inp = el('input', 'w-md');
+      inp.type = 'text';
+      inp.value = cur;
+      inp.placeholder = '直接输入（游戏里怎么写的就怎么填）';
+      if (dirty) inp.classList.add('dirty');
+      inp.onchange = function () { cur = inp.value; onPick(cur, inp); };
+      wrap.appendChild(inp);
+      var back = el('button', 'btn sm ghost', '▾ 用列表选');
+      back.type = 'button';
+      back.onclick = function () { cur = inp.value; buildSelect(); };
+      wrap.appendChild(back);
+    }
+    function buildSelect() {
+      clear(wrap);
+      var s = optionsSelect(opts, cur, dirty, function (v, ctl) {
+        if (v === CUSTOM_V) { buildInput(); return; }
+        cur = v;
+        onPick(v, ctl);
+      });
+      var op = el('option', null, '✎ 自己填一个…');
+      op.value = CUSTOM_V;
+      s.appendChild(op);
+      s.value = cur || (opts.length ? opts[0].v : '');
+      wrap.appendChild(s);
+    }
+    buildSelect();
+    return wrap;
+  }
+
   function control(fid, o, row) {
     var val = pv(fid, o.path, o.value);
     var dirty = isPending(fid, o.path);
@@ -284,7 +321,7 @@
       if (o.ui === 'select') {
         return optionsSelect(optList, val, dirty, fire);
       }
-      return comboInput(optList, val, dirty, fire);
+      return comboSelect(optList, val, dirty, fire);
     }
 
     var ctl;
@@ -959,9 +996,10 @@
     tc.appendChild(hint('BetterGI 界面里也能改这两样，界面里的设置优先级更高（我们只在保存时按你的选择写一次）。'));
     v.appendChild(tc);
 
-    var want = { PartyName: 1, DomainName: 1, WeeklyDomainEnabled: 1, DailyRewardPartyName: 1 };
+    var want = { PartyName: 1, DomainName: 1, DailyRewardPartyName: 1 };
     var dMeta = gs.domain_meta || {};
-    var dc = card('秘境与队伍', '秘境名从 BetterGI 的传送点数据里读（按类型分组、后面跟着国家区域），也可以自己填。');
+    var dc = card('秘境与队伍', '秘境名是下拉（点开就有全部 74 个，按圣遗物/天赋/武器/一次性/周本分组，后面跟着国家区域）；' +
+      '列表里没有的可以选「自己填一个…」。队伍名同理。');
     var detail = el('div', 'detail');
     function showDomain(name) {
       var d = dMeta[name];
@@ -981,10 +1019,11 @@
       var r = fieldRow('bg_daily', withNode(f));
       dc.appendChild(r);
       if (f.key === 'DomainName') {
-        var inp = r.querySelector('input');
-        if (inp) {
-          inp.addEventListener('input', function () { showDomain(inp.value); });
-          inp.addEventListener('change', function () { showDomain(inp.value); });
+        // 现在是真下拉（select），不是输入框了
+        var box = r.querySelector('select, input');
+        if (box) {
+          box.addEventListener('change', function () { showDomain(box.value); });
+          box.addEventListener('input', function () { showDomain(box.value); });
         }
         dc.appendChild(detail);
         showDomain(pv('bg_daily', 'DomainName', f.value));
@@ -993,6 +1032,61 @@
     dc.appendChild(hint('队伍名要和游戏里队伍的名字完全一致；留空就用界面里当前选中的队伍。' +
       '原神官方没有把秘境掉落写进任何本地数据，所以这里只给类型和开放规则，不编套装名。'));
     v.appendChild(dc);
+
+    // 每周秘境：daily.json 里 {Monday..Sunday}DomainName / {Day}PartyName（BetterGI 一条龙的「每周秘境」）
+    var wc = card('每周秘境（周一到周日分别指定）',
+      '打开「打每周秘境」后，一条龙按当天是周几去打对应秘境；某天选「（不打）」= 那天不打秘境。' +
+      '这就是 BetterGI 一条龙里的『每周秘境』，周一到周日各自一套秘境 + 队伍。');
+    var wf = g.fields.filter(function (x) { return x.key === 'WeeklyDomainEnabled'; })[0];
+    if (wf) {
+      var wfo = withNode({ key: 'WeeklyDomainEnabled', label: wf.label, type: wf.type, value: wf.value });
+      wfo.help = '打开=按下面周一到周日分别打；关掉=只用上面那个默认秘境。';
+      wc.appendChild(fieldRow('bg_daily', wfo));
+    }
+    var DOMAIN_OPTS = flattenOptions(gs.domains || []);
+    if (!DOMAIN_OPTS.length) {
+      DOMAIN_OPTS = (gs.domain_names || []).map(function (x) { return { v: x, l: x, g: '' }; });
+    }
+    var wday = el('table', 'tb');
+    var whr = el('tr');
+    ['周几', '秘境', '队伍'].forEach(function (h) { whr.appendChild(el('th', null, h)); });
+    wday.appendChild(whr);
+    g.days.forEach(function (d) {
+      var trw = el('tr');
+      trw.appendChild(el('td', null, d.cn));
+      var tdKey = el('td');
+      var curD = pv('bg_daily', d.key + 'DomainName', (byName[d.key + 'DomainName'] || {}).value || '');
+      var list = DOMAIN_OPTS.slice();
+      if (curD && !list.some(function (x) { return x.v === curD; })) {
+        list.unshift({ v: curD, l: curD + '（当前值，不在上游列表里）', g: '' });
+      }
+      tdKey.appendChild(optionsSelect([{ v: '', l: '（不打）', g: '' }].concat(list), curD, false, function (val, ctl) {
+        ctl.classList.add('dirty');
+        setPending('bg_daily', d.key + 'DomainName', val);
+      }));
+      trw.appendChild(tdKey);
+      var tdTeam = el('td');
+      var teams = (gs.teams || []).map(function (x) { return { v: x, l: x, g: '' }; });
+      var tk = pv('bg_daily', d.key + 'PartyName', (byName[d.key + 'PartyName'] || {}).value || '');
+      if (teams.length) {
+        tdTeam.appendChild(comboSelect(teams, tk, false, function (val, ctl) {
+          ctl.classList.add('dirty');
+          setPending('bg_daily', d.key + 'PartyName', val);
+        }));
+      } else {
+        var tinp = el('input', 'w-md');
+        tinp.type = 'text';
+        tinp.value = tk;
+        tinp.onchange = function () { tinp.classList.add('dirty'); setPending('bg_daily', d.key + 'PartyName', tinp.value); };
+        tdTeam.appendChild(tinp);
+      }
+      trw.appendChild(tdTeam);
+      wday.appendChild(trw);
+    });
+    wc.appendChild(wday);
+    wc.appendChild(hint('队伍名留空=用游戏里当前选中的队伍；秘境名必须是游戏里显示的全名，下拉里选最保险。' +
+      '周本/圣遗物/天赋的开放规则在「全部配置 → 一条龙·每日任务」里能改。'));
+    v.appendChild(wc);
 
     var lc = card('地脉花', '每天按周几决定跑不跑、跑哪种、去哪个国家。周一~周日分别设置。');
     var LEY_HELP = {
@@ -1229,55 +1323,49 @@
       pc.appendChild(holder);
       v.appendChild(pc);
     }
-    // 原项目里「高级但常用」的一组：之前只暴露了常用项，这些全漏了
-    var ADV = [
-      ['培养目标（按目标自动挑副本）', ['build_target_enable', 'build_target_scheme', 'build_target_ornament_weekly_count',
-        'build_target_use_user_instance_when_only_erosion_and_ornament', 'break_down_level_four_relicset']],
-      ['队伍与传送', ['instance_team_enable', 'instance_team_number', 'instance_teams', 'tp_before_instance', 'instance_team_use_priority']],
-      ['燃料与沉浸器', ['merge_immersifier', 'merge_immersifier_limit', 'use_reserved_trailblaze_power',
-        'calyx_golden_preference', 'use_fuel']],
-      ['借人 / 支援', ['borrow_enable', 'borrow_character_enable', 'borrow_friends', 'borrow_scroll_times']],
-      ['每日细项', ['daily_enable', 'daily_himeko_try_enable', 'daily_memory_one_enable', 'daily_memory_one_team',
-        'daily_tasks', 'reward_assist_enable', 'reward_redemption_code_enable', 'reward_achievement_enable',
-        'reward_message_enable']],
-      ['周常 / 活动', ['echo_of_war_timestamp', 'echo_of_war_start_day_of_week', 'universe_enable',
-        'activity_gardenofplenty_enable', 'activity_realmofthestrange_enable', 'activity_planarfissure_enable',
-        'activity_journey_highlights_enable']],
-      ['启动与退出', ['game_path', 'launcher_path', 'update_via_launcher', 'start_game_timeout', 'update_game_timeout',
-        'exit_after_failure', 'pause_after_success', 'after_finish', 'check_update']],
-      ['其它', ['log_level', 'log_retention_days', 'log_overlay_enable', 'play_audio', 'debug_mode_enable',
-        'scheduled_on_conflict', 'scheduled_chain_continue_on_failure', 'home_cards', 'telemetry_id']]
-    ];
+    // 崩铁：按上游 config.yaml 的功能前缀分组，每个功能一张卡（开关 + 全部细节），不再手写白名单
     var advFields = walkFields(t.tree);
     var byFieldName = {};
     advFields.forEach(function (n) { byFieldName[n.name] = n; });
-    var advCard = card('培养目标与进阶设置', '这些是原项目 config.yaml 里有、但之前配置中心没露出来的项。' +
-      '「优先培养目标」打开后，三月七会按你选的培养方案自动挑该刷的副本。');
-    ADV.forEach(function (g) {
-      var has = g[1].filter(function (k) { return byFieldName[k]; });
-      if (!has.length) return;
-      var d = el('details', 'grp');
-      if (g[0].indexOf('培养目标') === 0) d.setAttribute('open', 'open');
-      var sum = el('summary');
-      sum.appendChild(el('span', null, g[0]));
-      sum.appendChild(el('span', 'badge dim', String(has.length)));
-      d.appendChild(sum);
-      var bd = el('div', 'grp-body');
-      has.forEach(function (k) { bd.appendChild(fieldRow('m7a', byFieldName[k])); });
-      d.appendChild(bd);
-      advCard.appendChild(d);
-    });
-    v.appendChild(advCard);
+    var feats = (opt.starrail || {}).features || [];
+    var covered = {};
+    if (feats.length) {
+      var advCard = card('每个功能的详细设置', '按三月七自己的功能分组排的：每张卡是一个功能，开关决定跑不跑，' +
+        '点开就是这一项的全部设置（模拟宇宙、货币战争、差分宇宙、历战余响、忘却之庭、虚构叙事、末日幻影…都在）。');
+      feats.forEach(function (f) {
+        var nodes = (f.keys || []).map(function (k) { return byFieldName[k]; }).filter(Boolean);
+        if (!nodes.length) return;
+        nodes.forEach(function (n) { covered[n.name] = 1; });
+        var on = nodes.some(function (n) {
+          return n.type === 'bool' && n.value && /(^|_)enable$/.test(n.name);
+        });
+        var d = el('details', 'grp');
+        if (on) d.setAttribute('open', 'open');
+        var sum = el('summary');
+        sum.appendChild(el('span', null, f.name));
+        sum.appendChild(el('span', 'badge ' + (on ? 'ok' : 'dim'), on ? '已启用' : '未启用'));
+        sum.appendChild(el('span', 'badge dim', String(nodes.length) + ' 项'));
+        d.appendChild(sum);
+        var bd = el('div', 'grp-body');
+        if (f.desc) bd.appendChild(hint(f.desc));
+        nodes.forEach(function (n) { bd.appendChild(fieldRow('m7a', n)); });
+        d.appendChild(bd);
+        advCard.appendChild(d);
+      });
+      v.appendChild(advCard);
+    }
 
-    var cc = card('全部设置', '崩铁的 config.yaml 有几百项，下面按分组折叠；也可以直接改原文。');
-    cc.appendChild(buttons([
-      { text: '展开/收起由你点分组标题', sm: true, onClick: function () { } },
-      { text: '去『全部配置』页编辑原文', sm: true, onClick: function () { S.advFid = 'm7a'; S.advMode = 'raw'; go('advanced'); } }
-    ]));
-    var body = el('div', 'mt8');
-    treeNodes('m7a', t.tree, body, 1);
-    cc.appendChild(body);
-    v.appendChild(cc);
+    var leftNodes = advFields.filter(function (n) { return !covered[n.name]; });
+    if (leftNodes.length) {
+      var cc = card('其它设置', '不属于上面任何一个功能的零散项（' + leftNodes.length + ' 项），默认折叠。');
+      cc.appendChild(buttons([
+        { text: '去『全部配置』页编辑原文', sm: true, onClick: function () { S.advFid = 'm7a'; S.advMode = 'raw'; go('advanced'); } }
+      ]));
+      var lbody = el('div', 'mt8');
+      treeNodes('m7a', leftNodes, lbody, 1);
+      cc.appendChild(lbody);
+      v.appendChild(cc);
+    }
     v.appendChild(oursCard(await loadOurs(), 'starrail', '我们自己的规则'));
   }
 
@@ -1511,6 +1599,34 @@
     d.appendChild(body);
     c3.appendChild(d);
     v.appendChild(c3);
+
+    // 每项功能的详细设置：OneDragon 每个 app 都有自己的 yml（config/01/one_dragon/<app_id>.yml）
+    var appCfg = (opt.zzz && opt.zzz.app_configs) || {};
+    var appNames2 = (opt.zzz && opt.zzz.app_labels) || {};
+    var appNames3 = (opt.zzz && opt.zzz.apps) || {};
+    var cfgIds = Object.keys(appCfg);
+    if (cfgIds.length) {
+      var dcard = card('每项功能的详细设置', 'OneDragon 每个功能都有自己的配置（config/01/one_dragon/<功能>.yml）。' +
+        '上面那张卡只决定这项功能跑不跑，这里改它内部的全部设置。');
+      for (var ci = 0; ci < cfgIds.length; ci++) {
+        var aid = cfgIds[ci];
+        if (aid === 'charge_plan') continue;
+        var tcfg;
+        try { tcfg = await loadTree(appCfg[aid]); } catch (e) { continue; }
+        var dcfg = el('details', 'grp');
+        var scfg = el('summary');
+        scfg.appendChild(el('span', null, appNames2[aid] || appNames3[aid] || aid));
+        scfg.appendChild(el('span', 'badge dim', aid));
+        dcfg.appendChild(scfg);
+        var bcfg = el('div', 'grp-body');
+        treeNodes(appCfg[aid], tcfg.tree, bcfg, 1);
+        dcfg.appendChild(bcfg);
+        dcard.appendChild(dcfg);
+      }
+      dcard.appendChild(hint('保存时会做语法自检并自动备份（config/backup/），改坏了能在『备份与恢复』里退回。' +
+        '体力计划（charge_plan）已经在上面那张卡里按副本一条条编辑了，这里不重复。'));
+      v.appendChild(dcard);
+    }
 
     var c4 = card('其它配置');
     c4.appendChild(buttons([

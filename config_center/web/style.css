@@ -231,3 +231,9 @@ pre.log{background:#0b0e14;border:1px solid var(--line);border-radius:11px;paddi
 .detail .dloc{color:#7f8ca3}
 tr.detailrow td{border-top:0;padding-top:0}
 
+
+/* 「下拉 + 自己填」组合：真下拉，旁边切换成输入框 */
+.combo2{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.combo2 select{min-width:180px}
+.combo2 input{min-width:180px}
+
