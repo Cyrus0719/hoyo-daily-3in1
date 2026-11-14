@@ -419,8 +419,6 @@ IMPORTANT = {
     ],
     "m7a": [
         ("game_path", "游戏路径", "StarRail.exe 完整路径"),
-        ("instance_names", "清体力：副本列表", "三月七的体力计划"),
-        ("instance_names_challenge_count", "各副本次数", "与上面一一对应"),
         ("use_reserved_trailblaze_power", "用后备开拓力", ""),
         ("use_fuel", "用燃料", ""),
         ("merge_immersifier", "优先合成沉浸器", "开了会挤掉刷本燃料"),

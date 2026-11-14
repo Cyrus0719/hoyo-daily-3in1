@@ -211,8 +211,24 @@ def build_adapter(game_key, g, targets):
     raise ValueError("未知游戏: " + game_key)
 
 
+def _log_tool_updates():
+    """后台查一次三个上游程序的版本，在日志里记一行（不拖慢主流程）。"""
+    def _work():
+        try:
+            import tools_manager
+            log.info("[更新] " + tools_manager.summary_line())
+        except Exception as e:  # noqa: BLE001
+            log.warning("[更新] 检查失败：%s", e)
+    try:
+        import threading
+        threading.Thread(target=_work, name="tool-updates", daemon=True).start()
+    except Exception:
+        pass
+
+
 def main():
     setup_log()
+    _log_tool_updates()
     if not _acquire_single_instance_lock():
         log.warning("已有 auto_daily 实例在运行，本次退出（防止重复启动游戏）")
         return 0

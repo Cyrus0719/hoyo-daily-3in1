@@ -18,7 +18,11 @@
     toolsTimer: null,
     treeCache: {},
     gs: null,
-    ours: null
+    ours: null,
+    options: null,
+    updates: null,
+    planDraft: null,
+    powerDraft: null
   };
 
   var NAV = [
@@ -174,6 +178,85 @@
   }
 
   /* ------------------------------------------------------------------ 控件 */
+  var comboSeq = 0;
+
+  /* 把 options 摊平成 [{v,l,g}]：支持字符串、{value,label}、{group,items} 三种写法 */
+  function flattenOptions(list) {
+    var out = [];
+    (list || []).forEach(function (o) {
+      if (o === null || o === undefined) return;
+      if (typeof o === 'string' || typeof o === 'number') {
+        out.push({ v: String(o), l: String(o), g: '' });
+      } else if (o.items) {
+        (o.items || []).forEach(function (it) {
+          var v = (it !== null && typeof it === 'object') ? (it.value !== undefined ? it.value : it.label) : it;
+          var l = (it !== null && typeof it === 'object') ? (it.label || it.value) : it;
+          out.push({ v: String(v), l: String(l), g: o.group || '' });
+        });
+      } else {
+        var vv = o.value !== undefined ? o.value : o.label;
+        out.push({ v: String(vv), l: String(o.label || o.value), g: o.group || '' });
+      }
+    });
+    return out;
+  }
+
+  function optionsSelect(opts, val, dirty, onPick) {
+    var s = el('select');
+    var groups = [], seen = {};
+    opts.forEach(function (o) { if (o.g && !seen[o.g]) { seen[o.g] = 1; groups.push(o.g); } });
+    function addOpt(parent, o) {
+      var op = el('option', null, o.l);
+      op.value = o.v;
+      parent.appendChild(op);
+    }
+    if (groups.length) {
+      opts.filter(function (o) { return !o.g; }).forEach(function (o) { addOpt(s, o); });
+      groups.forEach(function (g) {
+        var og = el('optgroup');
+        og.label = g;
+        opts.filter(function (o) { return o.g === g; }).forEach(function (o) { addOpt(og, o); });
+        s.appendChild(og);
+      });
+    } else {
+      opts.forEach(function (o) { addOpt(s, o); });
+    }
+    var cur = (val === null || val === undefined) ? '' : String(val);
+    var has = opts.some(function (o) { return o.v === cur; });
+    if (cur && !has) {
+      var extra = el('option', null, cur + '（当前值，不在上游列表里）');
+      extra.value = cur;
+      s.insertBefore(extra, s.firstChild);
+    }
+    s.value = cur || (opts.length ? opts[0].v : '');
+    if (dirty) s.classList.add('dirty');
+    s.onchange = function () { onPick(s.value, s); };
+    return s;
+  }
+
+  function comboInput(opts, val, dirty, onPick) {
+    var id = 'dl' + (comboSeq++);
+    var wrap = el('div', 'combo');
+    var inp = el('input', 'w-md');
+    inp.type = 'text';
+    inp.value = (val === null || val === undefined) ? '' : String(val);
+    inp.setAttribute('list', id);
+    inp.autocomplete = 'off';
+    if (dirty) inp.classList.add('dirty');
+    inp.onchange = function () { onPick(inp.value, inp); };
+    var dl = el('datalist');
+    dl.id = id;
+    opts.forEach(function (o) {
+      var op = el('option');
+      op.value = o.v;
+      if (o.l && o.l !== o.v) op.label = o.l;
+      dl.appendChild(op);
+    });
+    wrap.appendChild(inp);
+    wrap.appendChild(dl);
+    return wrap;
+  }
+
   function control(fid, o, row) {
     var val = pv(fid, o.path, o.value);
     var dirty = isPending(fid, o.path);
@@ -187,6 +270,15 @@
       setPending(fid, o.path, v);
       if (ctl) ctl.classList.add('dirty');
       if (row) row.classList.add('dirty');
+    }
+
+    // 上游有明确选项的字段：给下拉/可填可选的输入框，别让人手打
+    var optList = (o.ui && !o.secret) ? flattenOptions(o.options) : [];
+    if (optList.length) {
+      if (o.ui === 'select') {
+        return optionsSelect(optList, val, dirty, fire);
+      }
+      return comboInput(optList, val, dirty, fire);
     }
 
     var ctl;
@@ -315,10 +407,7 @@
         d.appendChild(body);
         host.appendChild(d);
       } else {
-        host.appendChild(fieldRow(fid, {
-          path: n.path, label: n.label, help: n.help, type: n.type,
-          value: n.value, secret: n.secret, readonly: n.readonly
-        }));
+        host.appendChild(fieldRow(fid, n));
       }
     });
   }
@@ -441,6 +530,62 @@
     return S.ours;
   }
 
+  async function loadOptions() {
+    if (!S.options) {
+      try { S.options = await getJSON('/options'); } catch (e) { S.options = {}; }
+    }
+    return S.options;
+  }
+
+  function groupBlock(fid, n, open) {
+    var d = el('details', 'grp');
+    d.open = !!open;
+    var sum = el('summary');
+    sum.appendChild(el('span', null, n.label || n.name));
+    sum.appendChild(el('span', 'badge dim', String(n.count != null ? n.count : (n.children || []).length)));
+    d.appendChild(sum);
+    var body = el('div', 'grp-body');
+    (n.children || []).forEach(function (c) {
+      if (c.kind === 'group') body.appendChild(groupBlock(fid, c, false));
+      else body.appendChild(fieldRow(fid, c));
+    });
+    d.appendChild(body);
+    return d;
+  }
+
+  async function loadUpdates(force) {
+    if (!force && S.updates) return S.updates;
+    try {
+      S.updates = await getJSON('/updates' + (force ? '?force=1' : ''));
+    } catch (e) {
+      S.updates = { tools: [], error: String(e) };
+    }
+    return S.updates;
+  }
+
+  function findNode(nodes, name) {
+    var list = nodes || [];
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i];
+      if (n.name === name) return n;
+      if (n.children) {
+        var r = findNode(n.children, name);
+        if (r) return r;
+      }
+    }
+    return null;
+  }
+
+  function walkFields(nodes, out) {
+    var list = nodes || [];
+    out = out || [];
+    list.forEach(function (n) {
+      if (n.kind === 'group') walkFields(n.children, out);
+      else if (n.kind === 'field') out.push(n);
+    });
+    return out;
+  }
+
   async function loadTree(fid) {
     if (!S.treeCache[fid]) S.treeCache[fid] = await getJSON('/tree?fid=' + encodeURIComponent(fid));
     return S.treeCache[fid];
@@ -504,14 +649,34 @@
     ]));
     v.appendChild(rc);
 
-    var tc = card('工具', '三个上游程序是否已下载安装。缺的可以到『工具』页一键下载。');
+    var tc = card('工具', '三个上游程序是否已安装、有没有新版。缺的可以到『工具』页一键下载/更新。');
     var chips = el('div', 'chips');
     s.tools.forEach(function (t) {
       chips.appendChild(badge(t.label + '：' + (t.installed ? '已安装' : '未安装'),
         t.installed ? 'ok' : 'warn'));
     });
     tc.appendChild(chips);
+    var upLine = el('div', 'hint mt8');
+    upLine.textContent = '正在检查上游版本…';
+    tc.appendChild(upLine);
     v.appendChild(tc);
+    loadUpdates(false).then(function (u) {
+      if (!document.body.contains(upLine)) return;
+      var rows = (u && u.tools) || [];
+      if (!rows.length) {
+        upLine.textContent = '版本检查失败' + (u && u.error ? '：' + u.error : '');
+        return;
+      }
+      clear(upLine);
+      upLine.appendChild(el('span', 'hint', '已装 / 最新：'));
+      rows.forEach(function (r) {
+        var txt = ' ' + r.label + ' ' + (r.installed || '未记录') + (r.latest ? ' → ' + r.latest : '');
+        upLine.appendChild(badge(txt, r.has_update === true ? 'warn' : 'dim'));
+      });
+      if (rows.some(function (r) { return r.has_update === true; })) {
+        upLine.appendChild(el('span', 'hint', '（有新版，去『工具』页更新）'));
+      }
+    });
 
     updateJobLine(s.job);
     S.jobTimer = setInterval(async function () {
@@ -554,6 +719,28 @@
     var g = await getJSON('/genshin');
     S.gs = g;
     var ours = await loadOurs();
+    var opt = (await loadOptions()) || {};
+    var gs = opt.genshin || {};
+    var COUNTRIES = (gs.countries && gs.countries.length) ? gs.countries
+      : ['蒙德', '璃月', '稻妻', '须弥', '枫丹', '纳塔', '挪德卡莱', '至冬'];
+    var LEY_TYPES = (gs.leyline_types && gs.leyline_types.length) ? gs.leyline_types : ['启示之花', '藏金之花'];
+
+    // 一条龙 daily.json 的全部字段（带下拉选项），按名字索引
+    var bt = await loadTree('bg_daily');
+    var dailyFields = walkFields(bt.tree);
+    var byName = {};
+    dailyFields.forEach(function (n) { byName[n.name] = n; });
+    function withNode(f) {
+      var o = { path: f.key, label: f.label, type: f.type, value: f.value };
+      var n = byName[f.key];
+      if (n) {
+        if (n.ui) o.ui = n.ui;
+        if (n.options) o.options = n.options;
+        if (n.opt_note) o.opt_note = n.opt_note;
+        if (n.help) o.help = n.help;
+      }
+      return o;
+    }
 
     var tc = card('一条龙任务', '按顺序执行。开关就是 BetterGI 一条龙里那 7 个任务。');
     g.tasks.forEach(function (t, i) {
@@ -570,23 +757,29 @@
       row.appendChild(ctl);
       tc.appendChild(row);
     });
+    tc.appendChild(hint('幽境危战、地脉花、首领讨伐也可以在这里开关；关着就不会跑。'));
     v.appendChild(tc);
 
     var want = { PartyName: 1, DomainName: 1, WeeklyDomainEnabled: 1, DailyRewardPartyName: 1 };
-    var dc = card('秘境与队伍');
+    var dc = card('秘境与队伍', '秘境名从 BetterGI 的传送点数据里读（按类型分组），也可以自己填。');
     g.fields.filter(function (f) { return want[f.key]; }).forEach(function (f) {
-      dc.appendChild(fieldRow('bg_daily', { path: f.key, label: f.label, type: f.type, value: f.value }));
+      dc.appendChild(fieldRow('bg_daily', withNode(f)));
     });
     dc.appendChild(hint('队伍名要和游戏里队伍的名字完全一致；留空就用界面里当前选中的队伍。'));
     v.appendChild(dc);
 
-    var lc = card('地脉花', '每天按周几决定跑不跑、跑哪种、去哪个国家。周一~周五按下面开关执行。');
-    ['LeyLineRunCount', 'LeyLineResinExhaustionMode'].forEach(function (k) {
+    var lc = card('地脉花', '每天按周几决定跑不跑、跑哪种、去哪个国家。周一~周日分别设置。');
+    var LEY_HELP = {
+      LeyLineResinExhaustionMode: '打开=一直刷到没树脂；关掉=只刷上面写死的次数（推荐，树脂耗尽模式会在地图里 OCR 树脂图标而不稳）',
+      LeyLineOneDragonMode: '打开=地脉花按一条龙方式跑（不再单独领奖、不买树脂）',
+      LeyLineOpenModeCountMin: '打开=只按最小次数判断'
+    };
+    ['LeyLineRunCount', 'LeyLineResinExhaustionMode', 'LeyLineOneDragonMode', 'LeyLineOpenModeCountMin'].forEach(function (k) {
       var f = g.fields.filter(function (x) { return x.key === k; })[0];
       if (!f) return;
-      var help = k === 'LeyLineResinExhaustionMode'
-        ? '打开=一直刷到没树脂；关掉=只刷固定次数（推荐，树脂耗尽模式会在地图里 OCR 树脂图标而不稳）' : '';
-      lc.appendChild(fieldRow('bg_daily', { path: f.key, label: f.label, type: f.type, value: f.value, help: help }));
+      var o = withNode({ key: k, label: f.label, type: f.type, value: f.value });
+      if (LEY_HELP[k]) o.help = LEY_HELP[k];
+      lc.appendChild(fieldRow('bg_daily', o));
     });
     var tb = el('table', 'tb');
     var thr = el('tr');
@@ -600,39 +793,81 @@
       tr.appendChild(td1);
       var td2 = el('td');
       var tp = pv('bg_daily', 'LeyLine' + d.key + 'Type', d.type);
-      if (tp || d.enabled) {
-        td2.appendChild(selectBox(LEY_TYPES, tp, function (val, ctl) {
-          ctl.classList.add('dirty');
-          setPending('bg_daily', 'LeyLine' + d.key + 'Type', val);
-        }));
-      } else {
-        td2.appendChild(el('span', 'hint', '（按上方开关）'));
-      }
+      td2.appendChild(optionsSelect(LEY_TYPES.map(function (x) { return { v: x, l: x, g: '' }; }), tp, false, function (val, ctl) {
+        ctl.classList.add('dirty');
+        setPending('bg_daily', 'LeyLine' + d.key + 'Type', val);
+      }));
       tr.appendChild(td2);
       var td3 = el('td');
       var cp = pv('bg_daily', 'LeyLine' + d.key + 'Country', d.country);
-      if (cp || d.enabled) {
-        td3.appendChild(selectBox(COUNTRIES, cp, function (val, ctl) {
-          ctl.classList.add('dirty');
-          setPending('bg_daily', 'LeyLine' + d.key + 'Country', val);
-        }));
-      }
+      td3.appendChild(optionsSelect(COUNTRIES.map(function (x) { return { v: x, l: x, g: '' }; }), cp, false, function (val, ctl) {
+        ctl.classList.add('dirty');
+        setPending('bg_daily', 'LeyLine' + d.key + 'Country', val);
+      }));
       tr.appendChild(td3);
       tb.appendChild(tr);
     });
     lc.appendChild(tb);
-    lc.appendChild(hint('『至冬』地脉花需要 BetterGI 0.66.0 以上（更早版本的至冬数据不全，会寻路失败）。'));
+    lc.appendChild(hint('『至冬』地脉花需要 BetterGI 0.66.0 以上；寻路失败会记 WARNING，不判整轮失败。'));
     v.appendChild(lc);
 
     var used = { PartyName: 1, DomainName: 1, WeeklyDomainEnabled: 1, DailyRewardPartyName: 1 };
-    var oc = card('其它一条龙设置');
-    g.fields.filter(function (f) { return !used[f.key]; }).forEach(function (f) {
-      oc.appendChild(fieldRow('bg_daily', { path: f.key, label: f.label, type: f.type, value: f.value }));
+    var bossKeys = [];
+    dailyFields.forEach(function (n) {
+      if (/^AutoBoss/.test(n.name) && !used[n.name]) bossKeys.push(n.name);
     });
-    v.appendChild(oc);
+    if (bossKeys.length) {
+      var bc = card('自动首领讨伐', 'daily.json 里 AutoBoss* 这一组。首领名、策略、队伍都给的是下拉，次数/复活次数是数字。');
+      bossKeys.forEach(function (nm) { bc.appendChild(fieldRow('bg_daily', byName[nm])); });
+      v.appendChild(bc);
+    }
+
+    var restFields = dailyFields.filter(function (n) {
+      if (used[n.name]) return false;
+      if (/^AutoBoss/.test(n.name)) return false;
+      if (/^LeyLine/.test(n.name)) return false;
+      if (/^TaskEnabledList|^TaskOrder$|^NextTaskId$/.test(n.name)) return false;
+      return true;
+    });
+    if (restFields.length) {
+      var oc = card('其它一条龙设置', 'daily.json 里剩下的字段，默认折叠。');
+      var og = el('details', 'grp');
+      og.open = false;
+      var ogSum = el('summary');
+      ogSum.appendChild(el('span', null, '展开 ' + restFields.length + ' 项'));
+      og.appendChild(ogSum);
+      var ogBody = el('div', 'grp-body');
+      restFields.forEach(function (n) { ogBody.appendChild(fieldRow('bg_daily', n)); });
+      og.appendChild(ogBody);
+      oc.appendChild(og);
+      v.appendChild(oc);
+    }
+
+    // BetterGI 程序自己的配置（User/config.json）
+    var mt = await loadTree('bg_main');
+    var HOT = /幽境|首领|秘境|地脉|战斗|启动|采集|钓鱼/;
+    var hotNodes = [];
+    var restNodes = [];
+    (mt.tree || []).forEach(function (n) {
+      if (n.kind === 'group' && HOT.test(n.label || '')) hotNodes.push(n);
+      else restNodes.push(n);
+    });
+    if (hotNodes.length) {
+      var hc = card('幽境危战 / 首领讨伐 / 战斗细节', '这些是 BetterGI 程序自己的设置（User/config.json），改完下次一条龙就用新值。');
+      hotNodes.forEach(function (n) { hc.appendChild(groupBlock('bg_main', n, true)); });
+      v.appendChild(hc);
+    }
+    if (restNodes.length) {
+      var rc2 = card('其它 BetterGI 程序设置', '其余分组默认折叠，点标题展开。');
+      restNodes.forEach(function (n) {
+        rc2.appendChild(n.kind === 'group' ? groupBlock('bg_main', n, false) : fieldRow('bg_main', n));
+      });
+      v.appendChild(rc2);
+    }
 
     v.appendChild(oursCard(ours, 'genshin', '我们自己的规则', '这里的 targets 决定『打哪个秘境、哪些天打』。'));
   }
+
 
   function oursCard(ours, key, title, sub) {
     var g = (ours.games || {})[key] || {};
@@ -668,7 +903,88 @@
   async function pageStarrail(v) {
     clear(v);
     var t = await loadTree('m7a');
+    var opt = (await loadOptions()) || {};
+    var insMap = ((opt.starrail || {}).instance_names) || {};
     importantSection('m7a', t.important, v, '常用设置');
+
+    if (insMap && Object.keys(insMap).length) {
+      var ppNode = findNode(t.tree, 'power_plan');
+      var base = isPending('m7a', 'power_plan') ? pv('m7a', 'power_plan', [])
+        : ((ppNode && Array.isArray(ppNode.value)) ? ppNode.value : []);
+      var ppRows = base.map(function (r) {
+        return Array.isArray(r) ? [String(r[0] || ''), String(r[1] || ''), Number(r[2] || 0)] : ['', '', 0];
+      });
+      var types = Object.keys(insMap);
+      function namesOf(type) {
+        var m = insMap[type] || {};
+        return Object.keys(m).filter(function (k) { return m[k] !== '跳过'; });
+      }
+      function commitPP() {
+        setPending('m7a', 'power_plan', ppRows.map(function (r) { return [r[0], r[1], Number(r[2]) || 0]; }));
+      }
+      var pc = card('清体力计划', '按顺序刷这几项。副本类型、副本名都是下拉，次数是数字；改完点保存（整表替换，不会错位）。');
+      var holder = el('div');
+      function rebuildPP() {
+        clear(holder);
+        var tb = el('table', 'tb');
+        var thr = el('tr');
+        ['类型', '副本', '次数', ''].forEach(function (h) { thr.appendChild(el('th', null, h)); });
+        tb.appendChild(thr);
+        ppRows.forEach(function (r, i) {
+          var ns = namesOf(r[0]);
+          if (r[1] && ns.indexOf(r[1]) < 0) ns = [r[1]].concat(ns);
+          var tr = el('tr');
+          var td1 = el('td');
+          td1.appendChild(optionsSelect(types.map(function (x) { return { v: x, l: x, g: '' }; }), r[0], false, function (val) {
+            ppRows[i][0] = val;
+            var n2 = namesOf(val);
+            ppRows[i][1] = n2.length ? n2[0] : '';
+            commitPP(); rebuildPP();
+          }));
+          tr.appendChild(td1);
+          var td2 = el('td');
+          td2.appendChild(optionsSelect(ns.map(function (x) { return { v: x, l: x, g: '' }; }), r[1], false, function (val) {
+            ppRows[i][1] = val; commitPP();
+          }));
+          tr.appendChild(td2);
+          var td3 = el('td');
+          var num = el('input', 'w-sm');
+          num.type = 'number';
+          num.min = '0';
+          num.value = String(r[2]);
+          num.onchange = function () { ppRows[i][2] = Number(num.value) || 0; commitPP(); };
+          td3.appendChild(num);
+          tr.appendChild(td3);
+          var td4 = el('td');
+          var del = el('button', 'btn sm danger', '删除');
+          del.type = 'button';
+          del.onclick = function () { ppRows.splice(i, 1); commitPP(); rebuildPP(); };
+          td4.appendChild(del);
+          tr.appendChild(td4);
+          tb.appendChild(tr);
+        });
+        holder.appendChild(tb);
+        holder.appendChild(buttons([
+          {
+            text: '+ 加一条', sm: true, onClick: function () {
+              var t0 = types[0] || '';
+              var n0 = namesOf(t0);
+              ppRows.push([t0, n0.length ? n0[0] : '', 1]);
+              commitPP(); rebuildPP();
+            }
+          },
+          {
+            text: '看原始 YAML', sm: true, onClick: function () {
+              S.advFid = 'm7a'; S.advMode = 'raw'; go('advanced');
+            }
+          }
+        ]));
+        holder.appendChild(hint('存的是 [[副本类型, 副本名, 次数], …]。三月七助手按这个顺序刷；次数填 0 通常表示刷到没体力。'));
+      }
+      rebuildPP();
+      pc.appendChild(holder);
+      v.appendChild(pc);
+    }
     var cc = card('全部设置', '崩铁的 config.yaml 有几百项，下面按分组折叠；也可以直接改原文。');
     cc.appendChild(buttons([
       { text: '展开/收起由你点分组标题', sm: true, onClick: function () { } },
@@ -688,6 +1004,7 @@
     var game = await loadTree('od_game');
     var charge = await loadTree('od_charge');
     var ours = await loadOurs();
+    var opt = (await loadOptions()) || {};
 
     var c1 = card('账号与登录', '填了账号密码，掉登录时 OneDragon 会自己登进来。密码明文保存在本机 config 里，不会进仓库。');
     acc.important.forEach(function (o) { c1.appendChild(fieldRow('od_account', o)); });
@@ -697,11 +1014,37 @@
     game.important.forEach(function (o) { c2.appendChild(fieldRow('od_game', o)); });
     v.appendChild(c2);
 
+    var grpTree = null;
+    try { grpTree = await loadTree('od_group'); } catch (e) { grpTree = null; }
+    var appListNode = grpTree ? findNode(grpTree.tree, 'app_list') : null;
+    if (appListNode && (appListNode.children || []).length) {
+      var appsMap = (opt.zzz && opt.zzz.apps) || {};
+      var gc = card('一条龙要跑哪些功能', 'OneDragon 完整应用清单。关掉的就是一条龙不跑它（比如不刷零号空洞、不领都市基金、不锄大地）。');
+      (appListNode.children || []).forEach(function (child, i) {
+        var idNode = findNode([child], 'app_id');
+        var enNode = findNode([child], 'enabled');
+        var appId = idNode ? String(idNode.value) : '';
+        var cn = appsMap[appId] || appId;
+        var row = el('div', 'row');
+        row.dataset.search = (appId + ' ' + cn).toLowerCase();
+        var main = el('div', 'row-main');
+        main.appendChild(el('div', 'row-label', cn));
+        main.appendChild(el('div', 'row-path', 'app_list.' + i + '.enabled · ' + appId));
+        row.appendChild(main);
+        var ctl = el('div', 'row-ctl');
+        ctl.appendChild(switchBox('od_group', 'app_list.' + i + '.enabled', enNode ? !!enNode.value : false));
+        row.appendChild(ctl);
+        gc.appendChild(row);
+      });
+      gc.appendChild(hint('没列进来的应用（例如卦象集录、刮刮卡）在『全部配置 → 一条龙总开关』里。'));
+      v.appendChild(gc);
+    }
+
     var c3 = card('清电量计划', '这是绝区零真正执行的体力计划（不是我们 config 里的 zzz targets）。');
     charge.important.forEach(function (o) { c3.appendChild(fieldRow('od_charge', o)); });
     var d = el('details', 'grp mt8');
     var sum = el('summary');
-    sum.appendChild(el('span', null, '展开完整计划（plan_list 每一条）'));
+    sum.appendChild(el('span', null, '展开完整计划（plan_list 每一条，副本/任务都是下拉）'));
     d.appendChild(sum);
     var body = el('div', 'grp-body');
     treeNodes('od_charge', charge.tree, body, 1);
@@ -854,18 +1197,47 @@
   async function pageTools(v) {
     clear(v);
     var t = await getJSON('/tools');
-    var c = card('三个上游程序', '从官方 GitHub Release 下载（不复制别人的代码，只用官方发布包）。BetterGI 固定 0.66.0 并关闭了它自己的自动更新。');
-    var g3 = el('div', 'grid g3');
+    var up = {};
+    try {
+      var u = await loadUpdates(false);
+      ((u && u.tools) || []).forEach(function (r) { up[r.key] = r; });
+    } catch (e) { /* 忽略 */ }
+    var c = card('三个上游程序', '从官方 GitHub Release 下载（只用官方发布包，不复制别人的代码）。' +
+      'BetterGI 自己也开着自动更新；这里显示本地已装版本、上游最新版本，以及有没有新版。');
+    var upBar = el('div', 'btnrow');
+    upBar.appendChild(el('button', 'btn sm', '检查更新'));
+    upBar.lastChild.type = 'button';
+    upBar.lastChild.onclick = async function () {
+      var self = this;
+      self.disabled = true;
+      self.textContent = '检查中…';
+      var r = await loadUpdates(true);
+      self.disabled = false;
+      self.textContent = '检查更新';
+      if (r && r.error) toast('检查失败：' + r.error, 'err');
+      else toast('已刷新', 'ok');
+      render();
+    };
+    if (S.updates && S.updates.error) upBar.appendChild(el('span', 'hint', '　检查失败：' + S.updates.error));
+    c.appendChild(upBar);
+    var g3 = el('div', 'grid g3 mt12');
     t.tools.forEach(function (x) {
       var box = el('div', 'stat');
       box.appendChild(el('div', 'k', x.game + ' · ' + x.label));
+      var ur = up[x.key] || {};
       var line = el('div', 'mt8');
       line.appendChild(badge(x.installed ? '已安装' : '未安装', x.installed ? 'ok' : 'warn'));
-      if (x.tag) line.appendChild(el('span', 'hint', '  ' + x.tag));
+      if (ur.has_update === true) line.appendChild(badge(' 有新版 ' + (ur.latest || ''), 'warn'));
+      else if (ur.has_update === false) line.appendChild(badge(' 已是最新', 'dim'));
+      else if (ur.error) line.appendChild(badge(' 版本查不到', 'dim'));
       box.appendChild(line);
+      var vline = el('div', 'hint mt8');
+      vline.textContent = '已装 ' + (ur.installed || x.version || '未记录') +
+        ' · 最新 ' + (ur.latest || x.latest || '—');
+      box.appendChild(vline);
       box.appendChild(el('div', 'n mono', x.path));
       var b = el('div', 'btnrow mt8');
-      var ib = el('button', 'btn sm', x.installed ? '重新下载/更新' : '下载安装');
+      var ib = el('button', 'btn sm', x.installed ? (ur.has_update ? '更新到最新' : '重新下载') : '下载安装');
       ib.type = 'button';
       ib.onclick = function () { installTool(x.key, ib); };
       b.appendChild(ib);

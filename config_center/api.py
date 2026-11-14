@@ -17,6 +17,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from config_center import registry as R  # noqa: E402
+from config_center import options as OPT  # noqa: E402
 import tools_manager as tm  # noqa: E402
 import task_sched  # noqa: E402
 
@@ -305,16 +306,37 @@ def run_now(payload):
 
 
 # --------------------------------------------------------------------------- 工具
+def updates_get(force=False):
+    """三个上游程序的版本对比（带 30 分钟缓存；网络不通不影响页面）。"""
+    try:
+        rows = tm.updates(force=force)
+    except Exception as e:  # noqa: BLE001
+        return {"tools": [], "error": "%s: %s" % (type(e).__name__, e)}
+    out = []
+    for r in rows:
+        label, game = TOOL_LABELS.get(r["key"], (r["key"], ""))
+        r = dict(r)
+        r.update({"label": label, "game": game})
+        out.append(r)
+    return {"tools": out, "error": ""}
+
+
 def tools_get():
     st = tm.status()
+    upd = {r["key"]: r for r in updates_get().get("tools") or []}
     rows = []
     for key, meta in tm.TOOLS.items():
         label, game = TOOL_LABELS.get(key, (key, ""))
         rel = meta.get("exe") or meta.get("target") or ""
+        u = upd.get(key) or {}
         rows.append({"key": key, "label": label, "game": game,
                      "installed": bool(st["installed"].get(key)),
                      "path": str(rel), "repo": meta.get("repo", ""),
-                     "tag": meta.get("tag") or "最新版"})
+                     "tag": meta.get("tag") or "最新版",
+                     "version": u.get("installed") or "",
+                     "latest": u.get("latest") or "",
+                     "has_update": u.get("has_update"),
+                     "check_error": u.get("error") or ""})
     return {"tools": rows, "state": st}
 
 
@@ -517,6 +539,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(logs_list())
         if path == "/api/tools":
             return self._json(tools_get())
+        if path == "/api/updates":
+            return self._json(updates_get(force=qs.get("force") in ("1", "true", "yes")))
+        if path == "/api/options":
+            return self._json(OPT.payload())
         if path == "/api/genshin":
             return self._json(genshin_tasks())
         if path == "/api/accounts":

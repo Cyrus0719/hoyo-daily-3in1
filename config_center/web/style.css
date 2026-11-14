@@ -187,3 +187,9 @@ pre.log{background:#0b0e14;border:1px solid var(--line);border-radius:11px;paddi
 @media (max-width:1100px){.g3{grid-template-columns:1fr 1fr}.split{grid-template-columns:1fr}}
 @media (max-width:820px){.g2,.g3{grid-template-columns:1fr}.sidebar{width:64px;flex:0 0 64px}
   .brand b,.brand span,nav a .tail,nav .sect{display:none}nav a{justify-content:center}}
+/* 可填可选的组合框：看起来像下拉，但可以自己敲新值（队伍名/秘境名） */
+.combo{position:relative;display:inline-block;min-width:220px}
+.combo input{padding-right:26px;width:100%}
+.combo::after{content:"▾";position:absolute;right:9px;top:50%;transform:translateY(-50%);
+  color:var(--muted);font-size:11px;pointer-events:none}
+.combo select{width:100%}

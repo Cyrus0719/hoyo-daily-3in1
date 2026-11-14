@@ -31,8 +31,10 @@ except Exception:  # noqa: BLE001
 
 try:  # 既支持 python -m config_center.server，也支持直接跑本文件
     from . import labels as L
+    from . import options as OPT
 except ImportError:  # noqa: BLE001
     import labels as L
+    import options as OPT
 
 # --------------------------------------------------------------------------- 注册表
 BG = BASE / "tools" / "BetterGI" / "BetterGI"
@@ -85,6 +87,8 @@ _BUILTIN = [
     _entry("od_charge", "清电量计划", OD / "config" / "01" / "one_dragon" / "charge_plan.yml", "yaml", "zzz",
            group="绝区零", note="绝区零真正执行的体力计划（我们 config 里的 zzz targets 不生效）",
            special="zzz_charge"),
+    _entry("od_group", "一条龙总开关", OD / "config" / "01" / "one_dragon" / "_group.yml", "yaml", "zzz",
+           group="绝区零", note="一条龙里哪些功能跑：邮件、体力刷本、恶名狩猎、周常、零号空洞…"),
     _entry("od_notify", "通知设置", OD / "config" / "01" / "notify.yml", "yaml", "zzz", group="绝区零"),
     _entry("od_instance", "实例列表", OD / "config" / "one_dragon.yml", "yaml", "zzz", group="绝区零"),
     _entry("od_custom", "自定义配置", OD / "config" / "custom.yml", "yaml", "zzz", group="绝区零"),
@@ -474,13 +478,21 @@ def _node(meta, value, path, depth=0):
         return {"kind": "group", "name": name, "path": path,
                 "label": L.group_label(path, name, meta["game"]), "children": children,
                 "list_group": True, "count": len(value)}
-    return {
+    node = {
         "kind": "field", "name": name, "path": path, "type": _type_of(value),
         "value": value, "secret": _secret(meta, path),
         "label": L.field_label(path, name, meta["game"]),
         "help": L.help_text(path, meta["game"]),
         "readonly": path in meta["readonly"] or name.lower() in ("lastupdatescriptrepotime", "runforversion"),
     }
+    if not node["readonly"] and not node["secret"]:
+        try:  # 有明确枚举的字段给下拉，别让人手打（上游加了新选项这里自动跟着变）
+            opt = OPT.for_node(meta["id"], path, name, value)
+        except Exception:  # noqa: BLE001
+            opt = None
+        if opt:
+            node.update(opt)
+    return node
 
 
 def build_tree(fid):
@@ -490,12 +502,32 @@ def build_tree(fid):
     tree = [_node(meta, v, str(k)) for k, v in doc.items()]
     rules = L.IMPORTANT.get(meta["id"]) or L.IMPORTANT.get(meta["game"]) or []
     important = []
+    def _imp(path, label, help_txt, val):
+        item = {"path": path, "label": label, "help": help_txt,
+                "type": _type_of(val), "value": val, "secret": _secret(meta, path)}
+        if not item["secret"]:
+            try:
+                opt = OPT.for_node(meta["id"], path, path.rsplit(".", 1)[-1], val)
+            except Exception:  # noqa: BLE001
+                opt = None
+            if opt:
+                item.update(opt)
+        return item
+
     for path, label, help_txt in rules:
         val = get_path(doc, path, "<不存在>")
         if val == "<不存在>":
             continue
-        important.append({"path": path, "label": label, "help": help_txt,
-                          "type": _type_of(val), "value": val, "secret": _secret(meta, path)})
+        if isinstance(val, dict):
+            # 常用区里塞不下字典：展开成一行一个子项（子项还是字典/列表的跳过）
+            for k, sub in val.items():
+                if isinstance(sub, (dict, list)):
+                    continue
+                important.append(_imp("%s.%s" % (path, k), "%s · %s" % (label, k), help_txt, sub))
+            continue
+        if isinstance(val, list) and val and isinstance(val[0], (dict, list)):
+            continue
+        important.append(_imp(path, label, help_txt, val))
     return {
         "meta": {"id": meta["id"], "label": meta["label"], "game": meta["game"], "fmt": meta["fmt"],
                  "rel": str(meta["path"].relative_to(BASE)).replace(os.sep, "/"),
