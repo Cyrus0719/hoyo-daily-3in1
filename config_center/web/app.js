@@ -27,6 +27,7 @@
 
   var NAV = [
     { sect: '概览' },
+    { id: 'setup', title: '开始使用', sub: '第一次用按这里一步步来；只玩其中几个游戏也能用', ic: '①' },
     { id: 'overview', title: '总览', sub: '今天跑没跑、下次什么时候跑，一眼看全', ic: '◎' },
     { sect: '三个游戏' },
     { id: 'genshin', title: '原神', sub: 'BetterGI 一条龙：任务开关、秘境、地脉花', ic: '✦' },
@@ -223,6 +224,11 @@
     }
     var cur = (val === null || val === undefined) ? '' : String(val);
     var has = opts.some(function (o) { return o.v === cur; });
+    if (!has && cur) {  // 大小写/前后空格不一致（如 cpu vs CPU）也算同一个
+      var low = cur.trim().toLowerCase();
+      var same = opts.filter(function (o) { return o.v.trim().toLowerCase() === low; })[0];
+      if (same) { cur = same.v; has = true; }
+    }
     if (cur && !has) {
       var extra = el('option', null, cur + '（当前值，不在上游列表里）');
       extra.value = cur;
@@ -348,6 +354,100 @@
     if (dirty) ctl.classList.add('dirty');
     ctl.onchange = function () { fire(ctl.value, ctl); };
     return ctl;
+  }
+
+  /* 闹钟式时间选择：时/分两个下拉 + 常用时间一键选（不再是原生 time 控件的丑样子） */
+  function alarmPicker(val, dirty, onPick) {
+    var wrap = el('div', 'alarm');
+    var cur = String(val || '07:00');
+    var hm = cur.split(':');
+    var hh = parseInt(hm[0], 10); if (isNaN(hh)) hh = 7;
+    var mm = parseInt(hm[1], 10); if (isNaN(mm)) mm = 0;
+
+    var hs = el('select', 'alarm-h');
+    for (var i = 0; i < 24; i++) {
+      var o = el('option', null, (i < 10 ? '0' : '') + i);
+      o.value = String(i);
+      hs.appendChild(o);
+    }
+    hs.value = String(hh);
+    var ms = el('select', 'alarm-m');
+    for (var j = 0; j < 60; j++) {
+      var o2 = el('option', null, (j < 10 ? '0' : '') + j);
+      o2.value = String(j);
+      ms.appendChild(o2);
+    }
+    ms.value = String(mm);
+    var colon = el('span', 'alarm-colon', ':');
+    var tail = el('span', 'alarm-tail', '每天');
+    if (dirty) { hs.classList.add('dirty'); ms.classList.add('dirty'); }
+
+    function emit() { onPick(pad2(hs.value) + ':' + pad2(ms.value)); }
+    function pad2(x) { x = String(x); return x.length < 2 ? '0' + x : x; }
+    hs.onchange = emit;
+    ms.onchange = emit;
+    wrap.appendChild(hs);
+    wrap.appendChild(colon);
+    wrap.appendChild(ms);
+    wrap.appendChild(tail);
+
+    var presets = el('div', 'chips mt8');
+    [['06:00', '早起'], ['06:30', ''], ['07:00', ''], ['07:10', '现在'], ['07:30', ''],
+      ['08:00', '上班'], ['12:00', '午休'], ['18:00', ''], ['22:00', '睡前']].forEach(function (p) {
+      var b = el('button', 'chip' + (p[0] === cur ? ' on' : ''), p[0] + (p[1] ? ' ' + p[1] : ''));
+      b.type = 'button';
+      b.onclick = function () {
+        var a = p[0].split(':');
+        hs.value = String(parseInt(a[0], 10));
+        ms.value = String(parseInt(a[1], 10));
+        var chips = wrap.parentNode ? wrap.parentNode.querySelectorAll('.chip') : [];
+        for (var k = 0; k < chips.length; k++) chips[k].classList.remove('on');
+        b.classList.add('on');
+        emit();
+      };
+      presets.appendChild(b);
+    });
+    var box = el('div');
+    box.appendChild(wrap);
+    box.appendChild(presets);
+    return box;
+  }
+
+  /* 有序列表编辑器：上下移 + 开关。items: [{id,label,sub,enabled,onToggle?}] */
+  function orderEditor(items, onMove, onToggle) {
+    var wrap = el('div', 'orderlist');
+    items.forEach(function (it, i) {
+      var row = el('div', 'orow');
+      row.dataset.search = ((it.label || '') + ' ' + (it.sub || '')).toLowerCase();
+      row.appendChild(el('span', 'onum', String(i + 1)));
+      var main = el('div', 'orow-main');
+      main.appendChild(el('div', 'row-label', it.label || it.id));
+      if (it.sub) main.appendChild(el('div', 'row-path', it.sub));
+      row.appendChild(main);
+      if (onToggle && it.enabled !== undefined) {
+        var sw = el('button', 'switch');
+        sw.type = 'button';
+        sw.dataset.on = it.enabled ? '1' : '0';
+        sw.onclick = function () {
+          var on = sw.dataset.on !== '1';
+          sw.dataset.on = on ? '1' : '0';
+          sw.classList.add('dirty');
+          onToggle(i, on);
+        };
+        row.appendChild(sw);
+      }
+      var btns = el('div', 'obtns');
+      [['↑', -1], ['↓', 1]].forEach(function (d) {
+        var b = el('button', 'btn sm ghost', d[0]);
+        b.type = 'button';
+        b.disabled = (d[1] < 0 && i === 0) || (d[1] > 0 && i === items.length - 1);
+        b.onclick = function () { onMove(i, i + d[1]); };
+        btns.appendChild(b);
+      });
+      row.appendChild(btns);
+      wrap.appendChild(row);
+    });
+    return wrap;
   }
 
   function fieldRow(fid, o) {
@@ -505,7 +605,8 @@
     clear(v);
     v.appendChild(el('div', 'hint', '读取中…'));
     try {
-      if (p.id === 'overview') await pageOverview(v);
+      if (p.id === 'setup') await pageSetup(v);
+      else if (p.id === 'overview') await pageOverview(v);
       else if (p.id === 'genshin') await pageGenshin(v);
       else if (p.id === 'starrail') await pageStarrail(v);
       else if (p.id === 'zzz') await pageZzz(v);
@@ -589,6 +690,81 @@
   async function loadTree(fid) {
     if (!S.treeCache[fid]) S.treeCache[fid] = await getJSON('/tree?fid=' + encodeURIComponent(fid));
     return S.treeCache[fid];
+  }
+
+  /* ------------------------------------------------------------------ 开始使用 */
+  async function pageSetup(v) {
+    clear(v);
+    var st = await getJSON('/setup');
+    var PAGE_OF = { tools: 'tools', schedule: 'schedule', accounts: 'accounts',
+      genshin: 'genshin', starrail: 'starrail', zzz: 'zzz' };
+
+    var head = card('欢迎：一次装好，之后每天自动跑',
+      '这个配置中心管三个游戏：原神（BetterGI）、崩坏：星穹铁道（三月七助手）、绝区零（OneDragon）。' +
+      '你只玩其中几个也完全可以 —— 先把「只玩哪几个游戏」定下来，其余按下面清单走。');
+    var stat = el('div', 'stats');
+    function st1(k, val, note) {
+      var b = el('div', 'stat');
+      b.appendChild(el('div', 'k', k));
+      b.appendChild(el('div', 'v', val));
+      if (note) b.appendChild(el('div', 'n', note));
+      stat.appendChild(b);
+    }
+    st1('每天跑的时间', st.daily_time || '（还没设）', '像上闹钟一样选几点几分');
+    st1('清单进度', String(st.total) + ' 步', st.ready ? '都做完了' : '还差 ' + st.total + ' 步');
+    st1('当前时间', (st.now || '').slice(11), (st.now || '').slice(0, 10));
+    var enabledCnt = (st.games || []).filter(function (g) { return g.enabled; }).length;
+    st1('要跑的游戏', enabledCnt + ' 个', enabledCnt === 0 ? '一个都没开，不会自动跑' : '关掉的不会跑');
+    head.appendChild(stat);
+    v.appendChild(head);
+
+    var gc = card('我玩哪几个游戏', '关掉的那个就不会被自动跑，也不影响剩下的。三个都关就等于不跑，' +
+      '这时候「帮我下载它的工具」也别做。');
+    var g3 = el('div', 'grid g3');
+    st.games.forEach(function (g) {
+      var box = el('div', 'stat');
+      var h = el('div', 'row');
+      h.appendChild(el('div', 'row-label', g.name));
+      h.appendChild(switchBox('ours', 'games.' + g.key + '.enabled', g.enabled));
+      box.appendChild(h);
+      var l1 = el('div', 'mt8');
+      l1.appendChild(badge(g.installed ? g.tool_label + ' 已装' : g.tool_label + ' 未装', g.installed ? 'ok' : 'warn'));
+      box.appendChild(l1);
+      box.appendChild(el('div', 'hint mt8', g.has_path ? ('游戏路径：' + g.path) : '游戏路径还没填/不存在'));
+      g3.appendChild(box);
+    });
+    gc.appendChild(g3);
+    v.appendChild(gc);
+
+    var lc = card('还差哪些步骤', '做完一项就自动打勾（除了手动跑一次那项，要真的跑成功才算）。');
+    st.steps.forEach(function (s, i) {
+      var row = el('div', 'row');
+      var main = el('div', 'row-main');
+      var lab = el('div', 'row-label steplab');
+      lab.appendChild(el('span', 'onum', String(i + 1)));
+      lab.appendChild(el('span', null, ' ' + s.title));
+      main.appendChild(lab);
+      main.appendChild(el('div', 'row-help', s.hint || ''));
+      row.appendChild(main);
+      var ctl = el('div', 'row-ctl');
+      ctl.appendChild(badge(s.done ? '已完成' : '待做', s.done ? 'ok' : 'warn'));
+      var b = el('button', 'btn sm', '去处理');
+      b.type = 'button';
+      b.onclick = function () { go(PAGE_OF[s.page] || s.page); };
+      ctl.appendChild(b);
+      row.appendChild(ctl);
+      lc.appendChild(row);
+    });
+    v.appendChild(lc);
+
+    var nc = card('第一次跑之前，必须知道的几件事');
+    ['· 每天到点由 Windows 计划任务启动（任务名 HoYoDaily），跑完自动关游戏、把屏幕模式恢复成你自己玩的设置。',
+      '· 你要做的只有一件事：偶尔确认游戏还能登录。掉登录时程序会用你填的账号密码自动登（绝不用手机验证码），滑块验证码挡路就只能手动登一次。',
+      '· BetterGI 官方就是需要管理员权限的，第一次跑之前留意一下有没有 UAC 弹窗没点。',
+      '· 想先验一个游戏：去「定时与运行」点「只跑原神 / 只跑崩铁 / 只跑绝区零」，比等第二天早上快。'
+    ].forEach(function (line) { nc.appendChild(hint(line)); });
+    v.appendChild(nc);
+
   }
 
   /* ------------------------------------------------------------------ 总览 */
@@ -742,30 +918,80 @@
       return o;
     }
 
-    var tc = card('一条龙任务', '按顺序执行。开关就是 BetterGI 一条龙里那 7 个任务。');
-    g.tasks.forEach(function (t, i) {
-      var row = el('div', 'row');
-      row.dataset.search = t.name.toLowerCase();
-      var main = el('div', 'row-main');
-      var lab = el('div', 'row-label');
-      lab.appendChild(el('span', null, (t.index >= 0 ? (t.index + 1) + '. ' : '') + t.name));
-      main.appendChild(lab);
-      main.appendChild(el('div', 'row-path', 'TaskEnabledList.' + t.guid));
-      row.appendChild(main);
-      var ctl = el('div', 'row-ctl');
-      ctl.appendChild(switchBox('bg_daily', 'TaskEnabledList.' + t.guid, t.enabled));
-      row.appendChild(ctl);
-      tc.appendChild(row);
-    });
-    tc.appendChild(hint('幽境危战、地脉花、首领讨伐也可以在这里开关；关着就不会跑。'));
+    // 一条龙任务：顺序（TaskOrder）+ 开关（TaskEnabledList），两样都能改
+    var taskByGuid = {};
+    g.tasks.forEach(function (t) { taskByGuid[t.guid] = t; });
+    var orderGuids = g.tasks.filter(function (t) { return t.index >= 0; })
+      .sort(function (a, b) { return a.index - b.index; })
+      .map(function (t) { return t.guid; });
+    g.tasks.forEach(function (t) { if (orderGuids.indexOf(t.guid) < 0) orderGuids.push(t.guid); });
+
+    var tc = card('一条龙任务：先打哪个、打不打',
+      '↑ ↓ 调顺序（对应 daily.json 的 TaskOrder），右边的开关是打不打（TaskEnabledList）。' +
+      '关着的任务在一条龙里就是「跳过」。');
+    var taskHolder = el('div');
+    function curEnabled(guid) {
+      var t = taskByGuid[guid] || {};
+      if (isPending('bg_daily', 'TaskEnabledList.' + guid)) {
+        return !!pv('bg_daily', 'TaskEnabledList.' + guid, t.enabled);
+      }
+      return !!t.enabled;
+    }
+    function rebuildTasks() {
+      clear(taskHolder);
+      taskHolder.appendChild(orderEditor(orderGuids.map(function (guid) {
+        var t = taskByGuid[guid] || { name: guid };
+        return { id: guid, label: t.name, sub: 'TaskEnabledList.' + guid, enabled: curEnabled(guid) };
+      }), function (from, to) {
+        if (to < 0 || to >= orderGuids.length) return;
+        var mv = orderGuids.splice(from, 1)[0];
+        orderGuids.splice(to, 0, mv);
+        setPending('bg_daily', 'TaskOrder', orderGuids.slice());
+        rebuildTasks();
+      }, function (i, on) {
+        var guid = orderGuids[i];
+        setPending('bg_daily', 'TaskEnabledList.' + guid, on);
+        rebuildTasks();
+      }));
+    }
+    rebuildTasks();
+    tc.appendChild(taskHolder);
+    tc.appendChild(hint('BetterGI 界面里也能改这两样，界面里的设置优先级更高（我们只在保存时按你的选择写一次）。'));
     v.appendChild(tc);
 
     var want = { PartyName: 1, DomainName: 1, WeeklyDomainEnabled: 1, DailyRewardPartyName: 1 };
-    var dc = card('秘境与队伍', '秘境名从 BetterGI 的传送点数据里读（按类型分组），也可以自己填。');
+    var dMeta = gs.domain_meta || {};
+    var dc = card('秘境与队伍', '秘境名从 BetterGI 的传送点数据里读（按类型分组、后面跟着国家区域），也可以自己填。');
+    var detail = el('div', 'detail');
+    function showDomain(name) {
+      var d = dMeta[name];
+      clear(detail);
+      if (!d) {
+        detail.textContent = name ? ('「' + name + '」查不到资料：可能是一次性秘境、名字抄错，或者上游数据里没有这个点。') : '';
+        detail.className = 'detail warn';
+        return;
+      }
+      detail.className = 'detail';
+      detail.appendChild(el('span', 'dname', name));
+      detail.appendChild(el('span', 'dtype', d.type_cn || d.type || ''));
+      detail.appendChild(el('span', 'drule', d.rule || ''));
+      if (d.country) detail.appendChild(el('span', 'dloc', d.country + (d.areas && d.areas.length ? ' · ' + d.areas.join('、') : '')));
+    }
     g.fields.filter(function (f) { return want[f.key]; }).forEach(function (f) {
-      dc.appendChild(fieldRow('bg_daily', withNode(f)));
+      var r = fieldRow('bg_daily', withNode(f));
+      dc.appendChild(r);
+      if (f.key === 'DomainName') {
+        var inp = r.querySelector('input');
+        if (inp) {
+          inp.addEventListener('input', function () { showDomain(inp.value); });
+          inp.addEventListener('change', function () { showDomain(inp.value); });
+        }
+        dc.appendChild(detail);
+        showDomain(pv('bg_daily', 'DomainName', f.value));
+      }
     });
-    dc.appendChild(hint('队伍名要和游戏里队伍的名字完全一致；留空就用界面里当前选中的队伍。'));
+    dc.appendChild(hint('队伍名要和游戏里队伍的名字完全一致；留空就用界面里当前选中的队伍。' +
+      '原神官方没有把秘境掉落写进任何本地数据，所以这里只给类型和开放规则，不编套装名。'));
     v.appendChild(dc);
 
     var lc = card('地脉花', '每天按周几决定跑不跑、跑哪种、去哪个国家。周一~周日分别设置。');
@@ -962,6 +1188,24 @@
           td4.appendChild(del);
           tr.appendChild(td4);
           tb.appendChild(tr);
+
+          // 这一条刷什么、什么时候开——直接从三月七自己的 instance_drops.json 读
+          var stInfo = opt.starrail || {};
+          var drops = ((stInfo.drops || {})[r[0]] || {})[r[1]] || [];
+          var rule = (stInfo.instance_rules || {})[r[0]] || '';
+          var det = el('tr', 'detailrow');
+          var td = el('td');
+          td.colSpan = 4;
+          var line = el('div', 'detail');
+          if (drops.length) {
+            line.appendChild(el('span', 'dname', '掉落'));
+            line.appendChild(el('span', 'drule', drops.join('、')));
+          }
+          if (rule) line.appendChild(el('span', 'dtype', rule));
+          if (!drops.length && !rule) line.appendChild(el('span', 'drule', '（这个副本上游没写掉落表）'));
+          td.appendChild(line);
+          det.appendChild(td);
+          tb.appendChild(det);
         });
         holder.appendChild(tb);
         holder.appendChild(buttons([
@@ -985,6 +1229,46 @@
       pc.appendChild(holder);
       v.appendChild(pc);
     }
+    // 原项目里「高级但常用」的一组：之前只暴露了常用项，这些全漏了
+    var ADV = [
+      ['培养目标（按目标自动挑副本）', ['build_target_enable', 'build_target_scheme', 'build_target_ornament_weekly_count',
+        'build_target_use_user_instance_when_only_erosion_and_ornament', 'break_down_level_four_relicset']],
+      ['队伍与传送', ['instance_team_enable', 'instance_team_number', 'instance_teams', 'tp_before_instance', 'instance_team_use_priority']],
+      ['燃料与沉浸器', ['merge_immersifier', 'merge_immersifier_limit', 'use_reserved_trailblaze_power',
+        'calyx_golden_preference', 'use_fuel']],
+      ['借人 / 支援', ['borrow_enable', 'borrow_character_enable', 'borrow_friends', 'borrow_scroll_times']],
+      ['每日细项', ['daily_enable', 'daily_himeko_try_enable', 'daily_memory_one_enable', 'daily_memory_one_team',
+        'daily_tasks', 'reward_assist_enable', 'reward_redemption_code_enable', 'reward_achievement_enable',
+        'reward_message_enable']],
+      ['周常 / 活动', ['echo_of_war_timestamp', 'echo_of_war_start_day_of_week', 'universe_enable',
+        'activity_gardenofplenty_enable', 'activity_realmofthestrange_enable', 'activity_planarfissure_enable',
+        'activity_journey_highlights_enable']],
+      ['启动与退出', ['game_path', 'launcher_path', 'update_via_launcher', 'start_game_timeout', 'update_game_timeout',
+        'exit_after_failure', 'pause_after_success', 'after_finish', 'check_update']],
+      ['其它', ['log_level', 'log_retention_days', 'log_overlay_enable', 'play_audio', 'debug_mode_enable',
+        'scheduled_on_conflict', 'scheduled_chain_continue_on_failure', 'home_cards', 'telemetry_id']]
+    ];
+    var advFields = walkFields(t.tree);
+    var byFieldName = {};
+    advFields.forEach(function (n) { byFieldName[n.name] = n; });
+    var advCard = card('培养目标与进阶设置', '这些是原项目 config.yaml 里有、但之前配置中心没露出来的项。' +
+      '「优先培养目标」打开后，三月七会按你选的培养方案自动挑该刷的副本。');
+    ADV.forEach(function (g) {
+      var has = g[1].filter(function (k) { return byFieldName[k]; });
+      if (!has.length) return;
+      var d = el('details', 'grp');
+      if (g[0].indexOf('培养目标') === 0) d.setAttribute('open', 'open');
+      var sum = el('summary');
+      sum.appendChild(el('span', null, g[0]));
+      sum.appendChild(el('span', 'badge dim', String(has.length)));
+      d.appendChild(sum);
+      var bd = el('div', 'grp-body');
+      has.forEach(function (k) { bd.appendChild(fieldRow('m7a', byFieldName[k])); });
+      d.appendChild(bd);
+      advCard.appendChild(d);
+    });
+    v.appendChild(advCard);
+
     var cc = card('全部设置', '崩铁的 config.yaml 有几百项，下面按分组折叠；也可以直接改原文。');
     cc.appendChild(buttons([
       { text: '展开/收起由你点分组标题', sm: true, onClick: function () { } },
@@ -995,6 +1279,168 @@
     cc.appendChild(body);
     v.appendChild(cc);
     v.appendChild(oursCard(await loadOurs(), 'starrail', '我们自己的规则'));
+  }
+
+  /* 绝区零体力计划：一条条编辑，副本名按「大类 → 类型 → 副本」级联筛选，下面带奖励提示 */
+  function zzzPlanEditor(fid, listNode, opt) {
+    var comp = (opt.zzz && opt.zzz.compendium) || {};
+    var tabs = Object.keys(comp).filter(function (k) { return (comp[k] || []).length; });
+    var levels = ((opt.zzz && opt.zzz.levels) || []).slice();
+    var battles = ((opt.zzz && opt.zzz.auto_battle_configs) || []).slice();
+    function catsOf(tab) {
+      return (comp[tab] || []).map(function (c) { return c.name; });
+    }
+    function catObj(tab, cat) {
+      return (comp[tab] || []).filter(function (x) { return x.name === cat; })[0];
+    }
+    function typesOf(tab, cat) {
+      var c = catObj(tab, cat);
+      return c ? (c.mission_types || []) : [];
+    }
+    function missionsOf(tab, cat, tname) {
+      var t = typesOf(tab, cat).filter(function (x) { return x.name === tname; })[0];
+      return t ? (t.missions || []) : [];
+    }
+    var items = (listNode.children || []).map(function (ch) {
+      var o = {};
+      (ch.children || []).forEach(function (f) { if (f.kind === 'field') o[f.name] = f.value; });
+      return o;
+    });
+    var wrap = el('div');
+    function commit() {
+      setPending(fid, 'plan_list', items.map(function (x) {
+        var y = {};
+        Object.keys(x).forEach(function (k) { y[k] = x[k]; });
+        return y;
+      }));
+    }
+    function newId() {
+      var s = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+      return s.replace(/[xy]/g, function (c) {
+        var r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : ((r & 3) | 8)).toString(16);
+      });
+    }
+    function rowWrap(label, helpText) {
+      var row = el('div', 'row');
+      var main = el('div', 'row-main');
+      main.appendChild(el('div', 'row-label', label));
+      if (helpText) main.appendChild(el('div', 'row-help', helpText));
+      row.appendChild(main);
+      var ctl = el('div', 'row-ctl');
+      row.appendChild(ctl);
+      return { row: row, ctl: ctl };
+    }
+    function numInput(value, onChange) {
+      var inp = el('input', 'w-md');
+      inp.type = 'number';
+      inp.min = '0';
+      inp.value = value === undefined || value === null ? '' : String(value);
+      inp.onchange = function () { onChange(Number(inp.value) || 0, inp); };
+      return inp;
+    }
+    function rebuild() {
+      clear(wrap);
+      if (!items.length) {
+        wrap.appendChild(hint('一条计划都没有：跑起来只做「恶名狩猎/双倍」这类固定次数的，剩下的体力不会被花掉。'));
+      }
+      items.forEach(function (it, i) {
+        var box = el('div', 'planbox');
+        var hd = el('div', 'planhd');
+        hd.appendChild(el('span', 'onum', String(i + 1)));
+        hd.appendChild(el('span', 'planname', it.mission_name || '新计划'));
+        var rm = el('button', 'btn sm danger', '删除');
+        rm.type = 'button';
+        rm.onclick = function () { items.splice(i, 1); commit(); rebuild(); };
+        hd.appendChild(rm);
+        box.appendChild(hd);
+
+        var r1 = rowWrap('副本大类', '来自 OneDragon 自己的副本清单，大类决定下面能选哪些类型');
+        r1.ctl.appendChild(selectBox(catsOf(it.tab_name).length ? catsOf(it.tab_name) : [it.category_name || ''], it.category_name, function (v) {
+          it.category_name = v;
+          var ts = typesOf(it.tab_name, v);
+          it.mission_type_name = ts.length ? ts[0].name : it.mission_type_name;
+          var ms = missionsOf(it.tab_name, it.category_name, it.mission_type_name);
+          it.mission_name = ms.length ? ms[0].value : it.mission_name;
+          commit(); rebuild();
+        }));
+        box.appendChild(r1.row);
+
+        var tNames = typesOf(it.tab_name, it.category_name).map(function (x) { return x.name; });
+        var r2 = rowWrap('副本类型', '只列这个大类下真的有的类型');
+        r2.ctl.appendChild(selectBox(tNames.length ? tNames : [it.mission_type_name || ''], it.mission_type_name, function (v) {
+          it.mission_type_name = v;
+          var ms = missionsOf(it.tab_name, it.category_name, v);
+          it.mission_name = ms.length ? ms[0].value : it.mission_name;
+          commit(); rebuild();
+        }));
+        box.appendChild(r2.row);
+
+        var ms = missionsOf(it.tab_name, it.category_name, it.mission_type_name);
+        var vals = ms.map(function (m) { return m.value; });
+        var r3 = rowWrap('副本名称', '');
+        r3.ctl.appendChild(selectBox(vals.length ? vals : [it.mission_name || ''], it.mission_name, function (v) {
+          it.mission_name = v; commit(); rebuild();
+        }));
+        box.appendChild(r3.row);
+
+        var picked = ms.filter(function (m) { return m.value === it.mission_name; })[0];
+        var det = el('div', 'detail');
+        det.appendChild(el('span', 'dname', it.mission_name || '（未选）'));
+        det.appendChild(el('span', 'dtype', (it.category_name || '?') + ' · ' + (it.mission_type_name || '?')));
+        if (picked && picked.label && picked.label !== it.mission_name) {
+          var mm = String(picked.label).match(/（([^（）]+)）\s*$/);
+          det.appendChild(el('span', 'drule', mm ? ('给：' + mm[1]) : ('说明：' + picked.label)));
+        } else {
+          det.appendChild(el('span', 'drule', '上游没写这项给什么'));
+        }
+        det.appendChild(el('span', 'dloc', '计划 ' + (it.plan_times || 0) + ' 次 · 已完成 ' + (it.run_times || 0)));
+        box.appendChild(det);
+
+        var r4 = rowWrap('难度', '默认等级就是游戏里默认那档');
+        r4.ctl.appendChild(selectBox(levels.length ? levels : [it.level || '默认等级'], it.level, function (v) {
+          it.level = v; commit();
+        }));
+        box.appendChild(r4.row);
+
+        var r5 = rowWrap('计划次数', '每天最多打几次');
+        r5.ctl.appendChild(numInput(it.plan_times, function (v) { it.plan_times = v; commit(); }));
+        box.appendChild(r5.row);
+
+        var r6 = rowWrap('自动战斗配置', '来自 OneDragon 的 config/auto_battle');
+        r6.ctl.appendChild(selectBox(battles.length ? battles : [it.auto_battle_config || ''], it.auto_battle_config, function (v) {
+          it.auto_battle_config = v; commit();
+        }));
+        box.appendChild(r6.row);
+
+        var r7 = rowWrap('队伍序号', '预设队伍从 1 开始');
+        r7.ctl.appendChild(numInput(it.predefined_team_idx, function (v) { it.predefined_team_idx = v; commit(); }));
+        box.appendChild(r7.row);
+
+        wrap.appendChild(box);
+      });
+      var add = el('button', 'btn sm', '+ 加一条');
+      add.type = 'button';
+      add.onclick = function () {
+        var tab = tabs[0] || '训练';
+        var cat = catsOf(tab)[0] || '';
+        var ty = typesOf(tab, cat)[0];
+        var ms2 = ty ? (ty.missions || []) : [];
+        items.push({
+          tab_name: tab, category_name: cat,
+          mission_type_name: ty ? ty.name : '',
+          mission_name: ms2.length ? ms2[0].value : '',
+          level: levels[0] || '默认等级',
+          auto_battle_config: battles[0] || '全配队通用',
+          run_times: 0, plan_times: 1, card_num: '默认数量',
+          predefined_team_idx: 3, notorious_hunt_buff_num: 1, plan_id: newId()
+        });
+        commit(); rebuild();
+      };
+      wrap.appendChild(add);
+    }
+    rebuild();
+    return wrap;
   }
 
   /* ------------------------------------------------------------------ 绝区零 */
@@ -1019,32 +1465,46 @@
     var appListNode = grpTree ? findNode(grpTree.tree, 'app_list') : null;
     if (appListNode && (appListNode.children || []).length) {
       var appsMap = (opt.zzz && opt.zzz.apps) || {};
-      var gc = card('一条龙要跑哪些功能', 'OneDragon 完整应用清单。关掉的就是一条龙不跑它（比如不刷零号空洞、不领都市基金、不锄大地）。');
-      (appListNode.children || []).forEach(function (child, i) {
+      var gc = card('一条龙要跑哪些功能、按什么顺序', '这就是 OneDragon 一条龙的完整应用清单：' +
+        '↑ ↓ 调执行顺序，右边开关决定跑不跑。全表替换保存，不会错位。');
+      var appsArr = [];
+      (appListNode.children || []).forEach(function (child) {
         var idNode = findNode([child], 'app_id');
         var enNode = findNode([child], 'enabled');
-        var appId = idNode ? String(idNode.value) : '';
-        var cn = appsMap[appId] || appId;
-        var row = el('div', 'row');
-        row.dataset.search = (appId + ' ' + cn).toLowerCase();
-        var main = el('div', 'row-main');
-        main.appendChild(el('div', 'row-label', cn));
-        main.appendChild(el('div', 'row-path', 'app_list.' + i + '.enabled · ' + appId));
-        row.appendChild(main);
-        var ctl = el('div', 'row-ctl');
-        ctl.appendChild(switchBox('od_group', 'app_list.' + i + '.enabled', enNode ? !!enNode.value : false));
-        row.appendChild(ctl);
-        gc.appendChild(row);
+        appsArr.push({ app_id: idNode ? String(idNode.value) : '', enabled: enNode ? !!enNode.value : false });
       });
-      gc.appendChild(hint('没列进来的应用（例如卦象集录、刮刮卡）在『全部配置 → 一条龙总开关』里。'));
+      var appHolder = el('div');
+      function commitApps() { setPending('od_group', 'app_list', appsArr.slice()); }
+      function rebuildApps() {
+        clear(appHolder);
+        appHolder.appendChild(orderEditor(appsArr.map(function (a) {
+          return { id: a.app_id, label: appsMap[a.app_id] || a.app_id, sub: 'app_id: ' + a.app_id, enabled: a.enabled };
+        }), function (from, to) {
+          if (to < 0 || to >= appsArr.length) return;
+          var mv = appsArr.splice(from, 1)[0];
+          appsArr.splice(to, 0, mv);
+          commitApps(); rebuildApps();
+        }, function (i, on) {
+          appsArr[i].enabled = on;
+          commitApps(); rebuildApps();
+        }));
+      }
+      rebuildApps();
+      gc.appendChild(appHolder);
+      gc.appendChild(hint('没列在这里的应用（例如卦象集录、刮刮卡）在『全部配置 → 一条龙总开关』里。'));
       v.appendChild(gc);
     }
 
-    var c3 = card('清电量计划', '这是绝区零真正执行的体力计划（不是我们 config 里的 zzz targets）。');
+    var c3 = card('清电量计划', '这是绝区零真正执行的体力计划（不是我们 config 里的 zzz targets）。' +
+      '副本名按「大类 → 类型 → 副本」三级筛选，选完下面会写这一项能给什么。');
     charge.important.forEach(function (o) { c3.appendChild(fieldRow('od_charge', o)); });
+    var planNode = findNode(charge.tree, 'plan_list');
+    if (planNode && (planNode.children || []).length !== undefined) {
+      c3.appendChild(zzzPlanEditor('od_charge', planNode, opt));
+    }
     var d = el('details', 'grp mt8');
     var sum = el('summary');
-    sum.appendChild(el('span', null, '展开完整计划（plan_list 每一条，副本/任务都是下拉）'));
+    sum.appendChild(el('span', null, '原始字段（plan_list 之外的东西，以及每条的完整键值）'));
     d.appendChild(sum);
     var body = el('div', 'grp-body');
     treeNodes('od_charge', charge.tree, body, 1);
@@ -1071,23 +1531,20 @@
     var ours = await loadOurs();
     var sc = ours.scheduler || {};
 
-    var c1 = card('每天几点跑', '保存后会同时改 Windows 计划任务。计划任务需要管理员权限才能改；没有权限时会先存配置，下次运行时程序自己再同步一次。');
+    var c1 = card('每天几点跑', '像上闹钟一样挑时和分（下面还有几个常用时间一点就好）。保存后会同时改 Windows 计划任务；' +
+      '没有管理员权限时会先存配置，下次运行程序自己再同步一次。');
     var row = el('div', 'row');
     var main = el('div', 'row-main');
     main.appendChild(el('div', 'row-label', '每日运行时间'));
-    main.appendChild(el('div', 'row-help', '0-23 时；建议比平时起床时间早，跑完你正好用电脑'));
+    main.appendChild(el('div', 'row-help', '建议比平时起床时间早，跑完你正好用电脑'));
     main.appendChild(el('div', 'row-path', 'scheduler.daily_time'));
     row.appendChild(main);
     var ctl = el('div', 'row-ctl');
-    var inp = el('input', 'w-sm');
-    inp.type = 'time';
-    inp.value = pv('ours', 'scheduler.daily_time', s.daily_time || '07:10');
-    if (isPending('ours', 'scheduler.daily_time')) inp.classList.add('dirty');
-    inp.onchange = function () {
-      inp.classList.add('dirty');
-      setPending('ours', 'scheduler.daily_time', inp.value);
-    };
-    ctl.appendChild(inp);
+    ctl.appendChild(alarmPicker(pv('ours', 'scheduler.daily_time', s.daily_time || '07:10'),
+      isPending('ours', 'scheduler.daily_time'), function (hhmm) {
+        setPending('ours', 'scheduler.daily_time', hhmm);
+        cur.textContent = '保存后计划任务会改成：每天 ' + hhmm;
+      }));
     row.appendChild(ctl);
     c1.appendChild(row);
     var cur = el('div', 'hint mt8');
@@ -1097,16 +1554,36 @@
     c1.appendChild(cur);
     v.appendChild(c1);
 
-    var c2 = card('运行顺序与超时');
-    Object.keys(sc).forEach(function (k) {
-      if (k === 'daily_time') return;
-      var f = sc[k];
-      c2.appendChild(fieldRow('ours', { path: 'scheduler.' + k, label: f.label, type: f.type, value: f.value, help: f.help }));
-    });
-    if (sc.run_order) {
-      c2.appendChild(hint('运行顺序是个数组，例如 ["genshin","starrail","zzz"]。'));
+    var c2 = card('运行顺序', '用 ↑ ↓ 调顺序：排在前面的先跑。三个游戏是串行跑的，前一个跑完才轮到下一个，' +
+      '所以顺序决定了「万一前面卡住，后面还能不能赶上」。');
+    var GNAMES = { genshin: '原神', starrail: '崩坏：星穹铁道', zzz: '绝区零' };
+    var curOrder = (isPending('ours', 'scheduler.run_order') ? pv('ours', 'scheduler.run_order', [])
+      : (sc.run_order && sc.run_order.value) || ['genshin', 'starrail', 'zzz']).slice();
+    ['genshin', 'starrail', 'zzz'].forEach(function (k) { if (curOrder.indexOf(k) < 0) curOrder.push(k); });
+    var orderHolder = el('div');
+    function rebuildOrder() {
+      clear(orderHolder);
+      orderHolder.appendChild(orderEditor(curOrder.map(function (k) {
+        return { id: k, label: GNAMES[k] || k, sub: k, enabled: undefined };
+      }), function (from, to) {
+        if (to < 0 || to >= curOrder.length) return;
+        var mv = curOrder.splice(from, 1)[0];
+        curOrder.splice(to, 0, mv);
+        setPending('ours', 'scheduler.run_order', curOrder.slice());
+        rebuildOrder();
+      }, null));
     }
+    rebuildOrder();
+    c2.appendChild(orderHolder);
     v.appendChild(c2);
+
+    var c2b = card('超时与开机等待');
+    Object.keys(sc).forEach(function (k) {
+      if (k === 'daily_time' || k === 'run_order') return;
+      var f = sc[k];
+      c2b.appendChild(fieldRow('ours', { path: 'scheduler.' + k, label: f.label, type: f.type, value: f.value, help: f.help }));
+    });
+    v.appendChild(c2b);
 
     var c3 = card('立即运行', '整轮用计划任务启动（无 UAC）；单独跑某个游戏会直接开进程。');
     c3.appendChild(buttons([
@@ -1196,6 +1673,8 @@
   /* ------------------------------------------------------------------ 工具 */
   async function pageTools(v) {
     clear(v);
+    var src = null;
+    try { src = await getJSON('/sources'); } catch (e) { src = null; }
     var t = await getJSON('/tools');
     var up = {};
     try {
@@ -1254,6 +1733,97 @@
     c.appendChild(st);
     v.appendChild(c);
     updateToolState(t.state);
+
+    // ---- 下载源（三月七那种 450MB 的包，直连经常被卡死，得能换源）
+    if (src && src.sources) {
+      var info = src.sources;
+      var sd = (info && info.sources) ? info
+        : { order: (info && info.order) || [], sources: [], extra_mirrors: (info && info.extra_mirrors) || [] };
+      var sc = card('下载源', '按顺序自动换源：第一个失败或太慢就走下一个。国内社区常用镜像加快，' +
+        '有梯子的话「本机代理」通常最快。');
+      var order = sd.order.slice();
+      var srcHolder = el('div');
+      var speed = {};
+      function rebuildSrc() {
+        clear(srcHolder);
+        srcHolder.appendChild(orderEditor(order.map(function (id) {
+          var row = (sd.sources || []).filter(function (x) { return x.id === id; })[0] || { id: id, name: id };
+          var sp = speed[id];
+          return {
+            id: id, label: row.name,
+            sub: (row.note || '') + (sp ? '　测速：' + (sp.ok ? sp.kbs + ' KB/s' : '失败 ' + (sp.error || '')) : ''),
+            enabled: undefined
+          };
+        }), function (from, to) {
+          if (to < 0 || to >= order.length) return;
+          var mv = order.splice(from, 1)[0];
+          order.splice(to, 0, mv);
+          saveSrc();
+          rebuildSrc();
+        }, null));
+      }
+      function saveSrc() {
+        postJSON('/sources', { order: order, extra_mirrors: extraList }).then(function (r) {
+          if (fail(r)) return;
+          toast('下载源顺序已保存', 'ok');
+        });
+      }
+      var extraList = (sd.sources || []).filter(function (x) {
+        return String(x.id).indexOf('extra') === 0;
+      }).map(function (x) { return x.prefix; });
+      rebuildSrc();
+      sc.appendChild(srcHolder);
+
+      var bar = el('div', 'btnrow mt8');
+      var probeB = el('button', 'btn sm', '测速（各取 2MB）');
+      probeB.type = 'button';
+      probeB.onclick = function () {
+        probeB.disabled = true;
+        probeB.textContent = '测速中…';
+        getJSON('/sources/probe').then(function (r) {
+          probeB.disabled = false;
+          probeB.textContent = '测速（各取 2MB）';
+          if (r && r.error) { toast(r.error, 'err'); return; }
+          (r.rows || []).forEach(function (x) { speed[x.id] = x; });
+          rebuildSrc();
+          var best = (r.rows || []).filter(function (x) { return x.ok; })
+            .sort(function (a, b) { return b.kbs - a.kbs; })[0];
+          toast(best ? ('最快：' + best.name + '（' + best.kbs + ' KB/s）') : '所有源都连不上，检查网络', best ? 'ok' : 'err');
+        }).catch(function (e) {
+          probeB.disabled = false;
+          probeB.textContent = '测速（各取 2MB）';
+          toast('测速失败：' + e, 'err');
+        });
+      };
+      bar.appendChild(probeB);
+      sc.appendChild(bar);
+
+      var ex = el('div', 'row mt8');
+      var exm = el('div', 'row-main');
+      exm.appendChild(el('div', 'row-label', '自定义镜像前缀（可选，逗号分隔）'));
+      exm.appendChild(el('div', 'row-help', '格式像 https://某个镜像.com/ ，程序会把它拼在官方地址前面。'));
+      ex.appendChild(exm);
+      var exc = el('div', 'row-ctl');
+      var exi = el('input', 'w-lg');
+      exi.type = 'text';
+      exi.value = extraList.join(', ');
+      exi.placeholder = 'https://gh-proxy.com/';
+      exc.appendChild(exi);
+      ex.appendChild(exc);
+      sc.appendChild(ex);
+      var exb = el('div', 'btnrow');
+      var exSave = el('button', 'btn sm ghost', '保存镜像');
+      exSave.type = 'button';
+      exSave.onclick = function () {
+        extraList = exi.value.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s; });
+        saveSrc();
+      };
+      exb.appendChild(exSave);
+      sc.appendChild(exb);
+      sc.appendChild(hint('「更新三月七失败」八成是直连被卡：先点测速，把能跑的那个源拖到第一位再更新。' +
+        '官方 full.7z 是 453MB（比 full.zip 少 230MB），程序已经优先选 .7z。'));
+      v.appendChild(sc);
+    }
 
     S.toolsTimer = setInterval(async function () {
       try {

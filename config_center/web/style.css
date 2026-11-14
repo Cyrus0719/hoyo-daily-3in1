@@ -193,3 +193,41 @@ pre.log{background:#0b0e14;border:1px solid var(--line);border-radius:11px;paddi
 .combo::after{content:"▾";position:absolute;right:9px;top:50%;transform:translateY(-50%);
   color:var(--muted);font-size:11px;pointer-events:none}
 .combo select{width:100%}
+/* 闹钟式时间选择 */
+.alarm{display:inline-flex;align-items:center;gap:4px}
+.alarm select{font-size:19px;font-variant-numeric:tabular-nums;padding:6px 8px;border-radius:10px;
+  background:#10141d;border:1px solid var(--line2);color:var(--text);font-weight:600;min-width:70px;text-align:center}
+.alarm select:focus{outline:none;border-color:rgba(110,168,254,.65);box-shadow:0 0 0 3px rgba(110,168,254,.12)}
+.alarm .alarm-colon{font-size:20px;color:var(--muted);font-weight:700;margin:0 1px}
+.alarm .alarm-tail{font-size:11.5px;color:var(--dim);margin-left:8px}
+
+/* 有序列表（任务顺序 / 应用顺序 / 下载源顺序） */
+.row-label.steplab{display:flex;align-items:center;gap:9px}
+.row-label.steplab .onum{flex:0 0 auto}
+.orderlist{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+.orow{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;
+  background:#121721;border:1px solid #202836}
+.orow:hover{border-color:#2c374a}
+.onum{flex:0 0 22px;height:22px;border-radius:7px;display:grid;place-items:center;font-size:11px;
+  color:#93a0b8;background:#1b2331;font-variant-numeric:tabular-nums}
+.orow-main{flex:1;min-width:0}
+.orow-main .row-label{font-size:12.5px}
+.orow-main .row-path{font-size:9.5px;margin-top:2px}
+.obtns{display:flex;gap:4px;flex:0 0 auto}
+.obtns .btn{padding:3px 8px;min-width:26px}
+
+/* 副本/秘境详情行 */
+.planbox{border:1px solid #202836;border-radius:12px;padding:10px 12px 6px;margin:10px 0;background:#10151f}
+.planhd{display:flex;align-items:center;gap:9px;margin-bottom:6px}
+.planhd .planname{flex:1;font-size:13px;font-weight:600;color:#e6edfb}
+.planbox .row{padding:6px 0}
+.detail{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0 6px;padding:7px 10px;
+  border-radius:9px;background:rgba(110,168,254,.06);border:1px solid rgba(110,168,254,.16);
+  font-size:11.5px;color:#c8d3e6}
+.detail.warn{background:rgba(245,196,81,.07);border-color:rgba(245,196,81,.22);color:#e8d9a8}
+.detail .dname{font-weight:600;color:#eaf1ff}
+.detail .dtype{padding:1px 7px;border-radius:999px;background:rgba(139,108,246,.18);color:#c9bcff;font-size:10.5px}
+.detail .drule{color:#a9b6cd}
+.detail .dloc{color:#7f8ca3}
+tr.detailrow td{border-top:0;padding-top:0}
+

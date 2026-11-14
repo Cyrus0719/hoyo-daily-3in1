@@ -199,6 +199,92 @@ def genshin_save(payload):
     return R.save_ops("bg_daily", ops, note="原神一条龙任务")
 
 
+# --------------------------------------------------------------------------- 下载源
+def sources_get():
+    return {"sources": tm.sources_info(), "note": "下载时按这个顺序自动换源，第一个失败就走下一个"}
+
+
+def sources_save(payload):
+    info = tm.save_sources(order=payload.get("order"), extra_mirrors=payload.get("extra_mirrors"))
+    return {"ok": True, "sources": info}
+
+
+def sources_probe(url=""):
+    return tm.probe_sources(url=url or "", token=tm.default_token())
+
+
+# --------------------------------------------------------------------------- 新人引导
+_TOOL_OF_GAME = {"genshin": "bettergi", "starrail": "march7th", "zzz": "onedragon"}
+
+
+def setup_state():
+    """把「这台机器还差什么才能跑」一次算清，给「开始使用」页做向导。"""
+    def _doc(fid):
+        try:
+            return R.load_doc(fid)[1] or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    ours = _doc("ours")
+    games_cfg = ours.get("games") or {}
+    sched = ours.get("scheduler") or {}
+    m7a = _doc("m7a")
+    od_acc = _doc("od_account")
+    acc = _doc("accounts")
+    st = tm.status()
+    installed = st.get("installed") or {}
+
+    games = []
+    for key, name in GAMES:
+        g = games_cfg.get(key) or {}
+        path = str(g.get("client_path") or "")
+        if key == "starrail" and m7a.get("game_path"):
+            path = str(m7a.get("game_path"))
+        if key == "zzz" and od_acc.get("game_path"):
+            path = str(od_acc.get("game_path"))
+        a = acc.get(key) or {}
+        tk = _TOOL_OF_GAME[key]
+        games.append({
+            "key": key, "name": name,
+            "enabled": bool(g.get("enabled", True)),
+            "tool": tk, "tool_label": TOOL_LABELS[tk][0],
+            "installed": bool(installed.get(tk)),
+            "path": path, "has_path": bool(path) and Path(path).exists(),
+            "has_account": bool(a.get("account")) and bool(a.get("password")),
+            "auto_login": bool(g.get("auto_login", True)),
+        })
+
+    steps = []
+    for gm in games:
+        if not gm["installed"]:
+            steps.append({"id": "install_" + gm["tool"], "page": "tools", "done": False,
+                          "title": "下载安装 %s（%s）" % (gm["tool_label"], gm["name"]),
+                          "hint": "到「工具」页点「下载安装」；下载源可在同一页切换/测速。"})
+        elif not gm["has_path"]:
+            steps.append({"id": "path_" + gm["key"], "page": gm["key"], "done": False,
+                          "title": "填 %s 的游戏路径" % gm["name"],
+                          "hint": "在「%s」页顶部，填到 xxx.exe；程序靠它启动游戏、判断有没有开着。" % gm["name"]})
+        elif not gm["has_account"]:
+            steps.append({"id": "account_" + gm["key"], "page": "accounts", "done": False,
+                          "title": "填 %s 的账号密码（可选）" % gm["name"],
+                          "hint": "填了掉登录时能自动填账号密码；不填就得自己手动登。绝不用手机验证码。"})
+    if not (sched.get("daily_time") or ""):
+        steps.append({"id": "time", "page": "schedule", "done": False,
+                      "title": "定个每天自动跑的时间",
+                      "hint": "到「定时与运行」页挑几点几分，保存后会自动改进 Windows 计划任务。"})
+    runs, _last = _parse_daily_log()
+    on_games = [g["key"] for g in games if g["enabled"]]
+    ran_ok = [k for k in on_games if (runs.get(k) or {}).get("ok")]
+    steps.append({"id": "first_run", "page": "schedule", "done": bool(on_games) and len(ran_ok) == len(on_games),
+                  "title": "先手动跑一次，确认真的能打",
+                  "hint": "到「定时与运行」页点「只跑原神」之类，单独验一个游戏，比等第二天早上快。"
+                          + ("（已成功跑过：%s）" % "、".join(ran_ok) if ran_ok else "")})
+    done_n = sum(1 for s in steps if s["done"])
+    return {"games": games, "steps": steps, "ready": done_n == len(steps),
+            "done": done_n, "total": len(steps),
+            "daily_time": sched.get("daily_time", ""), "now": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
 # --------------------------------------------------------------------------- 账号
 def _mask(s):
     s = str(s or "")
@@ -549,6 +635,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(accounts_get())
         if path == "/api/ours":
             return self._json(our_settings())
+        if path == "/api/sources":
+            return self._json(sources_get())
+        if path == "/api/sources/probe":
+            return self._json(sources_probe(url=qs.get("url") or ""))
+        if path == "/api/setup":
+            return self._json(setup_state())
         if path == "/api/job":
             with JOB_LOCK:
                 j = dict(JOB)
@@ -588,6 +680,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(genshin_save(body))
             if path == "/api/accounts":
                 return self._json(accounts_save(body))
+            if path == "/api/sources":
+                return self._json(sources_save(body))
             if path == "/api/open":
                 fid = body.get("fid") or ""
                 meta = R.get(fid)

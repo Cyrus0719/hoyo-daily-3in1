@@ -78,8 +78,9 @@ def genshin_points():
             bucket = out.setdefault(t, [])
             if any(x["name"] == name for x in bucket):
                 continue
+            areas = [str(a).strip() for a in (pt.get("areas") or []) if str(a).strip()]
             bucket.append({"name": name, "country": (pt.get("country") or "").strip(),
-                           "area": (pt.get("area") or "").strip()})
+                           "area": "·".join(areas[:2])})
     return out
 
 
@@ -272,6 +273,39 @@ def m7a_instance_names():
         return json.load(fh)
 
 
+def m7a_drops():
+    """{副本类型: {副本名: [掉落物名]}} —— 三月七自带的掉落表，用来在副本后面提示奖励。"""
+    p = M7A / "assets" / "config" / "instance_drops.json"
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+# 崩铁副本的开放规则（按类型，不猜具体副本）
+_M7A_INSTANCE_RULES = {
+    "拟造花萼（金）": "常驻开放 · 每次 10 开拓力（或 1 次双倍）",
+    "拟造花萼（赤）": "常驻开放 · 每次 10 开拓力",
+    "凝滞虚影": "常驻开放 · 每次 30 开拓力",
+    "侵蚀隧洞": "常驻开放 · 每次 40 开拓力",
+    "饰品提取": "常驻开放 · 每次 40 开拓力",
+    "历战余响": "每周 1 次免费奖励 · 每次 30 开拓力 · 周一 04:00 重置",
+}
+
+
+def m7a_instance_detail(type_name, inst_name):
+    """给某个副本拼一句详情：奖励 + 开放规则。"""
+    type_name = str(type_name or "")
+    inst_name = str(inst_name or "")
+    drops = (_cached("m7a_drops", m7a_drops) or {}).get(type_name) or {}
+    items = drops.get(inst_name) or []
+    parts = []
+    if items:
+        parts.append("奖励：" + "、".join(items[:6]))
+    rule = _M7A_INSTANCE_RULES.get(type_name)
+    if rule:
+        parts.append(rule)
+    return " · ".join(parts)
+
+
 # --------------------------------------------------------------------------- 绝区零
 def zzz_compendium():
     """[{tab, category, mission_types:[{name, missions:[{value,label}]}]}]"""
@@ -344,13 +378,26 @@ def zzz_all_mission_types():
 
 
 def zzz_auto_battle_configs():
-    names = ["全配队通用"]
-    d = OD / "config" / "01" / "one_dragon" / "auto_battle"
-    if d.is_dir():
-        for p in sorted(d.glob("*.yml")):
-            if p.stem not in names:
-                names.append(p.stem)
-    return names
+    """绝区零自动战斗配置：上游内置的在 config/auto_battle/*.sample.yml，
+    用户自己新增/覆盖的在 config/01/one_dragon/auto_battle/*.yml。"""
+    names = []
+    for d, pat in ((OD / "config" / "auto_battle", "*.sample.yml"),
+                   (OD / "config" / "auto_battle", "*.yml"),
+                   (OD / "config" / "01" / "one_dragon" / "auto_battle", "*.yml")):
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob(pat)):
+            stem = p.name
+            for suf in (".sample.yml", ".merged.yml", ".yml"):
+                if stem.endswith(suf):
+                    stem = stem[:-len(suf)]
+                    break
+            if stem and stem not in names:
+                names.append(stem)
+    if "全配队通用" in names:
+        names.remove("全配队通用")
+        names.insert(0, "全配队通用")
+    return names or ["全配队通用"]
 
 
 # --------------------------------------------------------------------------- 给某个配置字段找选项
@@ -437,12 +484,43 @@ def for_node(fid, path, name, value):
     return None
 
 
+# 原神秘境的类型 → 开放规则 / 树脂消耗（tp.json 只有类型和位置，没有奖励数据，别编套装名）
+_GS_DOMAIN_RULES = {
+    "BlessDomain": ("圣遗物秘境", "每天开放 · 每次 20 树脂（浓缩树脂 40）"),
+    "MasteryDomain": ("天赋培养素材", "按周几轮换（周一/周四、周二/周五、周三/周六，周日全开）· 每次 20 树脂"),
+    "ForgeryDomain": ("武器突破素材", "按周几轮换（周一/周四、周二/周五、周三/周六，周日全开）· 每次 20 树脂"),
+    "TrounceDomain": ("周本 / 首领", "每周 1 次领取奖励（30/60 树脂）· 周一 04:00 重置"),
+    "OneTimeDomain": ("一次性秘境", "打完就不会再刷，日常自动化不需要它"),
+}
+
+
+def genshin_domain_meta():
+    """{秘境名: {type, type_cn, country, areas, rule}} —— 给秘境名后面补详情用。"""
+    pts = _cached("gs_points", genshin_points) or {}
+    out = {}
+    for type_key, items in pts.items():
+        cn, rule = _GS_DOMAIN_RULES.get(type_key, ("", ""))
+        if not cn:
+            continue
+        for x in items:
+            name = x.get("name") or ""
+            if not name:
+                continue
+            cur = out.setdefault(name, {"type": type_key, "type_cn": cn, "rule": rule,
+                                        "country": x.get("country") or "", "areas": []})
+            area = x.get("area") or ""
+            if area and area not in cur["areas"]:
+                cur["areas"].append(area)
+    return out or None
+
+
 def payload():
     """给前端一次性拿全部选项（原神/崩铁/绝区零页面用）。"""
     return {
         "genshin": {
             "domains": _cached("gs_domains", genshin_domains),
             "domain_names": _cached("gs_domains2", genshin_domain_names),
+            "domain_meta": _cached("gs_domain_meta", genshin_domain_meta),
             "countries": _cached("gs_countries", genshin_countries),
             "teams": _cached("gs_teams", genshin_teams),
             "strategies": _cached("gs_strat", genshin_strategies),
@@ -454,6 +532,8 @@ def payload():
         "starrail": {
             "enums": _cached("m7a_enums", m7a_enums) or {},
             "instance_names": _cached("m7a_instance_names", m7a_instance_names) or {},
+            "drops": _cached("m7a_drops", m7a_drops) or {},
+            "instance_rules": _M7A_INSTANCE_RULES,
         },
         "zzz": {
             "compendium": _cached("zzz_comp", zzz_compendium) or {},

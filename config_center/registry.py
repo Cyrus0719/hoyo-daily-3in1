@@ -11,6 +11,7 @@
         再写 .tmp，最后 os.replace 原子替换 —— 中途断电也不会把配置写坏。
 YAML 优先用 ruamel.yaml 往返（保留注释和键顺序）；没装则退回 PyYAML。JSON 用标准库。
 """
+import copy
 import io
 import json
 import os
@@ -49,7 +50,8 @@ _SYSTEM_FILES = {"env.yml", "model.yml", "project.yml", "repository.yml",
                  "standalone_app.yml", "_group.yml"}
 
 
-def _entry(fid, label, path, fmt, game, group="", secret_hints=None, readonly=None, note="", special=""):
+def _entry(fid, label, path, fmt, game, group="", secret_hints=None, readonly=None, note="", special="",
+           schema=None, order=""):
     return {
         "id": fid,
         "label": label,
@@ -62,6 +64,11 @@ def _entry(fid, label, path, fmt, game, group="", secret_hints=None, readonly=No
         "note": note,
         "special": special,
         "system": Path(path).name in _SYSTEM_FILES,
+        # schema: 上游自带的默认配置示例。当前文件通常只写了改动过的键，
+        # 用它补全后界面才能看到全部可配项（写回时仍保持稀疏，不把默认值固化进去）。
+        "schema": Path(schema) if schema else None,
+        # order: 该文件支持"任务顺序"编辑时的策略名
+        "order": order,
     }
 
 
@@ -76,10 +83,12 @@ _BUILTIN = [
     _entry("bg_main", "BetterGI 主配置", BG / "User" / "config.json", "json", "genshin",
            group="原神", note="BetterGI 自己的全部设置（含启动/战斗/秘境/截图/热键）"),
     _entry("bg_daily", "一条龙 · 每日任务", BG / "User" / "OneDragon" / "daily.json", "json", "genshin",
-           group="原神", note="每天要跑哪些任务、打哪个秘境、地脉花怎么跑", special="genshin_daily"),
+           group="原神", note="每天要跑哪些任务、打哪个秘境、地脉花怎么跑", special="genshin_daily",
+           order="genshin_taskorder"),
 
     _entry("m7a", "三月七助手配置", M7A / "config.yaml", "yaml", "starrail",
-           group="崩铁", note="崩铁的全部设置：清体力计划、每日、活动、通知"),
+           group="崩铁", note="崩铁的全部设置：清体力计划、培养目标、每日、活动、通知",
+           schema=M7A / "assets" / "config" / "config.example.yaml"),
 
     _entry("od_game", "游戏与窗口", OD / "config" / "01" / "game.yml", "yaml", "zzz", group="绝区零"),
     _entry("od_account", "账号与登录", OD / "config" / "01" / "game_account.yml", "yaml", "zzz",
@@ -88,7 +97,8 @@ _BUILTIN = [
            group="绝区零", note="绝区零真正执行的体力计划（我们 config 里的 zzz targets 不生效）",
            special="zzz_charge"),
     _entry("od_group", "一条龙总开关", OD / "config" / "01" / "one_dragon" / "_group.yml", "yaml", "zzz",
-           group="绝区零", note="一条龙里哪些功能跑：邮件、体力刷本、恶名狩猎、周常、零号空洞…"),
+           group="绝区零", note="一条龙里哪些功能跑：邮件、体力刷本、恶名狩猎、周常、零号空洞…",
+           order="zzz_applist"),
     _entry("od_notify", "通知设置", OD / "config" / "01" / "notify.yml", "yaml", "zzz", group="绝区零"),
     _entry("od_instance", "实例列表", OD / "config" / "one_dragon.yml", "yaml", "zzz", group="绝区零"),
     _entry("od_custom", "自定义配置", OD / "config" / "custom.yml", "yaml", "zzz", group="绝区零"),
@@ -196,13 +206,67 @@ def _dump(meta, doc) -> str:
     return _pyyaml.safe_dump(doc, allow_unicode=True, sort_keys=False, width=4096)
 
 
-def load_doc(fid):
+def load_raw(fid):
+    """只读磁盘上的真实内容（不补默认值）。"""
     meta = get(fid)
     p = meta["path"]
     if not p.exists():
         raise FileNotFoundError(str(p))
     text = _read_text(p)
     return meta, _load(meta, text), text
+
+
+def _schema_doc(meta):
+    """读上游自带的默认配置示例（如三月七的 config.example.yaml）。"""
+    sp = meta.get("schema")
+    if not sp:
+        return None
+    try:
+        text = _read_text(Path(sp))
+    except OSError:
+        return None
+    try:
+        doc = _load({"fmt": meta["fmt"]}, text)
+    except Exception:  # noqa: BLE001
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _merge_defaults(cur, sch, path="", added=None):
+    """把 schema 里有、当前文件里没有的键补进 cur，并把补进来的路径记到 added。
+
+    只补"缺失"的键，已有值一律不动 —— 所以界面看到的是「当前值 + 上游默认值」，
+    而写回时仍写回稀疏文件（不把默认值固化，上游以后改默认值还能跟着变）。
+    """
+    if added is None:
+        added = set()
+    if not isinstance(cur, dict) or not isinstance(sch, dict):
+        return added
+    for k, v in sch.items():
+        p = (path + "." if path else "") + str(k)
+        if k not in cur:
+            cur[k] = copy.deepcopy(v)
+            added.add(p)
+        elif isinstance(cur[k], dict) and isinstance(v, dict):
+            _merge_defaults(cur[k], v, p, added)
+    return added
+
+
+def load_doc(fid):
+    """返回 (meta, doc, text)。doc = 当前值 + 上游默认值（schema 存在时）。
+
+    meta["_defaults"] 里是"这些值来自默认值、文件里还没有"的路径，
+    界面据此打上「默认」标记，用户一改就落盘。
+    """
+    meta, raw, text = load_raw(fid)
+    sch = _schema_doc(meta)
+    if not sch:
+        return meta, raw, text
+    merged = copy.deepcopy(raw)
+    added = _merge_defaults(merged, sch)
+    meta = dict(meta)
+    meta["_defaults"] = sorted(added)
+    return meta, merged, text
 
 
 def _write_atomic(p: Path, text: str):
@@ -356,19 +420,40 @@ def coerce(new, old):
     return new
 
 
-def apply_ops(meta, doc, ops):
-    """ops: [{op: set|add|del, path, value}]。返回实际生效的变更列表。"""
+def _materialize(doc, ref, path):
+    """要写的键只存在于"上游默认值"里时，先把这一整棵子树落到文件里，再改。"""
+    segs = _split(path)
+    if not segs or ref is None or not isinstance(doc, dict):
+        return
+    top = segs[0]
+    if top in doc:
+        return
+    val = ref.get(top) if isinstance(ref, dict) else None
+    if val is None:
+        return
+    doc[top] = copy.deepcopy(val) if isinstance(val, (dict, list)) else val
+
+
+def apply_ops(meta, doc, ops, ref=None):
+    """ops: [{op: set|add|del, path, value}]。返回实际生效的变更列表。
+
+    doc 是磁盘上的真实内容（稀疏），ref 是"当前值 + 上游默认值"的合并视图：
+    类型判断和"值没变"的判定都看 ref，写只写 doc，所以默认值不会被无谓地固化。
+    """
     applied = []
     for op in ops or []:
         kind = (op.get("op") or "set").lower()
         path = op.get("path") or ""
         if kind == "set":
-            old = get_path(doc, path, "<不存在>")
+            old_raw = get_path(doc, path, "<不存在>")
+            old = old_raw if old_raw != "<不存在>" else get_path(ref if ref is not None else doc, path, "<不存在>")
             new = coerce(op.get("value"), old if old != "<不存在>" else op.get("value"))
-            if old == new:
+            if old_raw != "<不存在>" and old_raw == new:
                 continue
+            _materialize(doc, ref, path)
             set_path(doc, path, new)
-            applied.append({"op": "set", "path": path, "old": old, "new": new})
+            applied.append({"op": "set", "path": path,
+                            "old": None if old == "<不存在>" else old, "new": new})
         elif kind == "add":
             parent = get_path(doc, path, None)
             if isinstance(parent, list):
@@ -387,11 +472,16 @@ def apply_ops(meta, doc, ops):
 
 
 def save_ops(fid, ops, note=""):
-    meta, doc, _text = load_doc(fid)
-    applied = apply_ops(meta, doc, ops)
+    meta, raw, _text = load_raw(fid)
+    ref = raw
+    sch = _schema_doc(meta)
+    if sch:
+        ref = copy.deepcopy(raw)
+        _merge_defaults(ref, sch)
+    applied = apply_ops(meta, raw, ops, ref=ref)
     if not applied:
         return {"ok": True, "applied": [], "backup": "", "changed": 0}
-    text = _dump(meta, doc)
+    text = _dump(meta, raw)
     _load(meta, text)  # 自检：写回去还能解析
     bak = backup(meta)
     _write_atomic(meta["path"], text)
@@ -464,15 +554,16 @@ def _secret(meta, path):
     return any(h in last for h in meta["secret_hints"])
 
 
-def _node(meta, value, path, depth=0):
+def _node(meta, value, path, depth=0, dset=None):
     name = _split(path)[-1] if path else ""
     if isinstance(value, dict):
-        children = [_node(meta, v, (path + "." if path else "") + str(k), depth + 1)
+        children = [_node(meta, v, (path + "." if path else "") + str(k), depth + 1, dset)
                     for k, v in value.items()]
         return {"kind": "group", "name": name, "path": path,
-                "label": L.group_label(path, name, meta["game"]), "children": children}
+                "label": L.group_label(path, name, meta["game"]), "children": children,
+                "is_default": bool(dset and path in dset)}
     if isinstance(value, list) and value and isinstance(value[0], dict):
-        children = [_node(meta, v, "%s.%d" % (path, i), depth + 1) for i, v in enumerate(value)]
+        children = [_node(meta, v, "%s.%d" % (path, i), depth + 1, dset) for i, v in enumerate(value)]
         for i, c in enumerate(children):
             c["label"] = ("第 %d 项" % (i + 1)) + ("：" + str(L.first_str(value[i])) if L.first_str(value[i]) else "")
         return {"kind": "group", "name": name, "path": path,
@@ -484,6 +575,8 @@ def _node(meta, value, path, depth=0):
         "label": L.field_label(path, name, meta["game"]),
         "help": L.help_text(path, meta["game"]),
         "readonly": path in meta["readonly"] or name.lower() in ("lastupdatescriptrepotime", "runforversion"),
+        # is_default: 这个键文件里还没写，值来自上游默认配置（改了就落盘）
+        "is_default": bool(dset and path in dset),
     }
     if not node["readonly"] and not node["secret"]:
         try:  # 有明确枚举的字段给下拉，别让人手打（上游加了新选项这里自动跟着变）
@@ -499,12 +592,14 @@ def build_tree(fid):
     meta, doc, text = load_doc(fid)
     if not isinstance(doc, dict):
         raise ValueError("配置根节点不是对象")
-    tree = [_node(meta, v, str(k)) for k, v in doc.items()]
+    dset = set(meta.get("_defaults") or [])
+    tree = [_node(meta, v, str(k), 0, dset) for k, v in doc.items()]
     rules = L.IMPORTANT.get(meta["id"]) or L.IMPORTANT.get(meta["game"]) or []
     important = []
     def _imp(path, label, help_txt, val):
         item = {"path": path, "label": label, "help": help_txt,
-                "type": _type_of(val), "value": val, "secret": _secret(meta, path)}
+                "type": _type_of(val), "value": val, "secret": _secret(meta, path),
+                "is_default": path in dset}
         if not item["secret"]:
             try:
                 opt = OPT.for_node(meta["id"], path, path.rsplit(".", 1)[-1], val)
@@ -528,9 +623,23 @@ def build_tree(fid):
         if isinstance(val, list) and val and isinstance(val[0], (dict, list)):
             continue
         important.append(_imp(path, label, help_txt, val))
+    fields = []
+
+    def _count(nodes):
+        for n in nodes:
+            if n.get("kind") == "group":
+                _count(n.get("children") or [])
+            else:
+                fields.append(n)
+
+    _count(tree)
     return {
         "meta": {"id": meta["id"], "label": meta["label"], "game": meta["game"], "fmt": meta["fmt"],
                  "rel": str(meta["path"].relative_to(BASE)).replace(os.sep, "/"),
-                 "note": meta["note"], "special": meta["special"], "size": len(text)},
+                 "note": meta["note"], "special": meta["special"], "size": len(text),
+                 "schema": str(Path(meta["schema"]).relative_to(BASE)).replace(os.sep, "/") if meta.get("schema") else "",
+                 "fields": len(fields),
+                 "defaults": sum(1 for n in fields if n.get("is_default")),
+                 "order": meta.get("order") or ""},
         "tree": tree, "important": important,
     }
