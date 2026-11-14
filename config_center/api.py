@@ -18,6 +18,7 @@ if str(BASE) not in sys.path:
 
 from config_center import registry as R  # noqa: E402
 from config_center import options as OPT  # noqa: E402
+from config_center import guide as GUIDE  # noqa: E402
 import tools_manager as tm  # noqa: E402
 import task_sched  # noqa: E402
 
@@ -629,6 +630,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(updates_get(force=qs.get("force") in ("1", "true", "yes")))
         if path == "/api/options":
             return self._json(OPT.payload())
+        if path == "/api/guide":
+            return self._json(GUIDE.guide_payload(force=qs.get("force") in ("1", "true", "yes")))
         if path == "/api/genshin":
             return self._json(genshin_tasks())
         if path == "/api/accounts":
@@ -683,6 +686,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/sources":
                 return self._json(sources_save(body))
             if path == "/api/open":
+                if body.get("path"):
+                    p = GUIDE.reveal(body.get("path"))
+                    return self._json({"ok": True, "msg": "已打开：" + p.name})
                 fid = body.get("fid") or ""
                 meta = R.get(fid)
                 os.startfile(str(meta["path"].parent))  # noqa: S606

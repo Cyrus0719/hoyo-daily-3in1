@@ -21,6 +21,7 @@
     ours: null,
     options: null,
     updates: null,
+    guide: null,
     planDraft: null,
     powerDraft: null
   };
@@ -37,6 +38,7 @@
     { id: 'schedule', title: '定时与运行', sub: '每天几点跑、运行顺序、立即运行一次', ic: '⏱' },
     { id: 'accounts', title: '账号与登录', sub: '掉登录时自动填账号密码（绝不用验证码）', ic: '⌘' },
     { id: 'tools', title: '工具', sub: '下载 / 更新 / 单独启动三个上游程序', ic: '⤓' },
+    { id: 'help', title: '帮助与排查', sub: '配置在哪、日志在哪、上游文档在哪：一键打开', ic: '⌕' },
     { sect: '高级' },
     { id: 'advanced', title: '全部配置', sub: '三游所有原生配置文件的完整表单与原文', ic: '⚙' },
     { id: 'logs', title: '日志', sub: '出问题先看这里', ic: '▤' },
@@ -605,6 +607,11 @@
     }).catch(function () {
       $('#footState').textContent = '计划任务未就绪';
     });
+    loadGuide().then(function (gd) {
+      var n = $('#ghStars');
+      var stars = ((gd || {}).repo || {}).stars;
+      if (n) n.textContent = (stars === null || stars === undefined || stars === '') ? '' : String(stars);
+    }).catch(function () {});
   }
 
   function highlightNav() {
@@ -650,6 +657,7 @@
       else if (p.id === 'schedule') await pageSchedule(v);
       else if (p.id === 'accounts') await pageAccounts(v);
       else if (p.id === 'tools') await pageTools(v);
+      else if (p.id === 'help') await pageHelp(v);
       else if (p.id === 'advanced') await pageAdvanced(v);
       else if (p.id === 'logs') await pageLogs(v);
       else if (p.id === 'backups') await pageBackups(v);
@@ -1186,6 +1194,7 @@
     }
 
     v.appendChild(oursCard(ours, 'genshin', '我们自己的规则', '这里的 targets 决定『打哪个秘境、哪些天打』。'));
+    await guideStrip(v, 'genshin');
   }
 
 
@@ -1367,6 +1376,7 @@
       v.appendChild(cc);
     }
     v.appendChild(oursCard(await loadOurs(), 'starrail', '我们自己的规则'));
+    await guideStrip(v, 'starrail');
   }
 
   /* 绝区零体力计划：一条条编辑，副本名按「大类 → 类型 → 副本」级联筛选，下面带奖励提示 */
@@ -1637,6 +1647,7 @@
 
     var o = oursCard(ours, 'zzz', '我们自己的设置', '注意：这里的 targets 对绝区零不生效，真正生效的是上面的清电量计划。');
     v.appendChild(o);
+    await guideStrip(v, 'zzz');
   }
 
   /* ------------------------------------------------------------------ 定时与运行 */
@@ -1988,6 +1999,188 @@
   }
 
   /* ------------------------------------------------------------------ 全部配置 */
+  /* ------------------------------------------------------------------ 帮助与排查 */
+  var GH_HOME = 'https://github.com/Cyrus0719/hoyo-daily-3in1';
+
+  async function loadGuide(force) {
+    if (!S.guide || force) {
+      try { S.guide = await getJSON('/guide' + (force ? '?force=1' : '')); }
+      catch (e) { S.guide = { groups: [], troubles: [], repo: {}, base: '' }; }
+    }
+    return S.guide;
+  }
+
+  function extLink(url, text, kind) {
+    var a = el('a', 'gbtn' + (kind ? ' ' + kind : ''), text || url);
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.title = url;
+    return a;
+  }
+
+  function openPath(p) {
+    var gd = S.guide || {};
+    var abs = p;
+    if (p && !/^[A-Za-z]:/.test(p) && p.charAt(0) !== '/') abs = (gd.base || '') + '/' + p;
+    postJSON('/open', { path: abs }).then(function (r) {
+      if (!fail(r)) toast(r.msg || '已打开');
+    }).catch(function (e) { toast('打开失败: ' + e.message, 'err'); });
+  }
+
+  function fmtSize(n) {
+    n = Number(n) || 0;
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+    return n + ' B';
+  }
+
+  function pathRow(row) {
+    var d = el('div', 'grow-row');
+    var main = el('div', 'grow-main');
+    var t = el('div', 'grow-title');
+    t.appendChild(el('span', null, row.label));
+    if (!row.exists) t.appendChild(badge('还没生成', 'dim'));
+    else if (row.kind === 'dir') t.appendChild(badge('目录', 'ok'));
+    else t.appendChild(badge('文件', 'ok'));
+    main.appendChild(t);
+    var line = el('div', 'grow-path');
+    line.appendChild(el('code', null, row.rel || row.path));
+    var meta = [];
+    if (row.mtime) meta.push(row.mtime);
+    if (row.size !== undefined && row.size !== null) {
+      meta.push(row.kind === 'dir' ? (row.size + ' 个文件') : fmtSize(row.size));
+    }
+    if (meta.length) line.appendChild(el('span', 'grow-meta', meta.join(' · ')));
+    main.appendChild(line);
+    if (row.hint) main.appendChild(el('div', 'grow-help', row.hint));
+    d.appendChild(main);
+    var btn = el('button', 'btn sm ghost', '打开');
+    btn.type = 'button';
+    if (!row.exists) btn.disabled = true;
+    btn.onclick = function () { openPath(row.path); };
+    d.appendChild(btn);
+    return d;
+  }
+
+  function linkChips(links, title) {
+    var wrap = el('div', 'gchips');
+    if (title) wrap.appendChild(el('span', 'ghead', title));
+    (links || []).forEach(function (l) { wrap.appendChild(extLink(l.url, l.label)); });
+    return wrap;
+  }
+
+  function guideCard(g) {
+    var c = card(g.title, g.sub);
+    (g.paths || []).forEach(function (r) { c.appendChild(pathRow(r)); });
+    if ((g.links || []).length) c.appendChild(linkChips(g.links, '上游文档与反馈入口'));
+    return c;
+  }
+
+  async function guideStrip(v, key) {
+    var gd = await loadGuide();
+    var g = (gd.groups || []).filter(function (x) { return x.key === key; })[0];
+    if (!g) return;
+    var d = el('details', 'grp gstrip');
+    var sum = el('summary');
+    sum.appendChild(el('span', null, '文件在哪、日志在哪（点开就能一键打开）'));
+    sum.appendChild(el('span', 'badge dim', String((g.paths || []).length) + ' 个路径'));
+    d.appendChild(sum);
+    var bd = el('div', 'grp-body');
+    (g.paths || []).forEach(function (r) { bd.appendChild(pathRow(r)); });
+    if ((g.links || []).length) bd.appendChild(linkChips(g.links, '上游文档'));
+    bd.appendChild(buttons([{ text: '看完整的『帮助与排查』', sm: true, onClick: function () { go('help'); } }]));
+    d.appendChild(bd);
+    v.appendChild(d);
+  }
+
+  function stepRow(num, title, desc, btns) {
+    var d = el('div', 'grow-row');
+    var main = el('div', 'grow-main');
+    var t = el('div', 'grow-title');
+    t.appendChild(el('span', 'stepnum', num));
+    t.appendChild(el('span', null, title));
+    main.appendChild(t);
+    if (desc) main.appendChild(el('div', 'grow-help', desc));
+    d.appendChild(main);
+    if (btns && btns.length) d.appendChild(buttons(btns));
+    return d;
+  }
+
+  function repoCard(repo) {
+    var c = card('关于本项目', '全部代码开源在 GitHub。觉得有用就点个 Star —— 它能让更多人搜到这个项目，也让作者知道有人在用。');
+    var d = el('div', 'grow-row');
+    var main = el('div', 'grow-main');
+    var t = el('div', 'grow-title');
+    t.appendChild(el('span', null, 'Cyrus0719 / hoyo-daily-3in1'));
+    if (repo.stars !== null && repo.stars !== undefined) t.appendChild(badge('★ ' + repo.stars, 'acc'));
+    if (repo.forks !== null && repo.forks !== undefined) t.appendChild(badge(repo.forks + ' fork', 'dim'));
+    if (repo.issues !== null && repo.issues !== undefined) t.appendChild(badge(repo.issues + ' 个未关闭 issue', 'dim'));
+    if (repo.release) t.appendChild(badge('最新 ' + repo.release, 'ok'));
+    main.appendChild(t);
+    main.appendChild(el('div', 'grow-help', repo.error
+      ? ('读取 GitHub 信息失败（网络问题）：' + repo.error)
+      : ('最近推送 ' + String(repo.pushed_at || '').replace('T', ' ').slice(0, 16))));
+    d.appendChild(main);
+    c.appendChild(d);
+    var chips = el('div', 'gchips');
+    var star = extLink(GH_HOME, '⭐ 去点 Star', 'star');
+    star.onclick = function () { toast('打开后点右上角 ⭐ Star 就行，谢谢！'); };
+    chips.appendChild(star);
+    chips.appendChild(extLink(GH_HOME + '/issues', '报问题 / 提需求'));
+    chips.appendChild(extLink(GH_HOME + '/releases', '下载最新版'));
+    chips.appendChild(extLink(GH_HOME + '/stargazers', '看看谁收藏了'));
+    c.appendChild(chips);
+    c.appendChild(hint('提 issue 时把 logs/daily.log 里『执行结束』前后三十行贴上来，比截图有用得多；' +
+      '如果是某个游戏自己的问题，再附上对应工具日志的那一段。'));
+    return c;
+  }
+
+  async function pageHelp(v) {
+    clear(v);
+    var gd = await loadGuide();
+    var repo = gd.repo || {};
+
+    var c0 = card('遇到问题先做这三步', '顺序别跳：先确认今天到底跑没跑，再看对应工具日志里那句失败特征，最后才去上游搜 issue。');
+    c0.appendChild(stepRow('1', '看总控日志', '每次运行一行『执行结束 ok=True/False』；失败原因、树脂消耗、开机判断都写在这儿。', [
+      { text: '打开总控日志', kind: 'primary', sm: true, onClick: function () { S.logName = 'daily'; go('logs'); } },
+      { text: '打开 logs 文件夹', sm: true, onClick: function () { openPath('logs'); } }
+    ]));
+    c0.appendChild(stepRow('2', '看对应游戏的日志',
+      '原神在 tools/BetterGI/BetterGI/log，崩铁在 tools/March7thAssistant/logs，绝区零在 OneDragon-ref/.log —— 下面每张卡都能一键打开。', []));
+    c0.appendChild(stepRow('3', '去上游搜 issue / 看 FAQ',
+      '很多问题上游早有人踩过；提 issue 时把日志里那段贴上去，比截图有用。', [
+        { text: '跳到『常见问题速查』', sm: true, onClick: function () { var n = $('#helpTrouble'); if (n) n.scrollIntoView({ block: 'start' }); } }
+      ]));
+    v.appendChild(c0);
+
+    (gd.groups || []).forEach(function (g) { v.appendChild(guideCard(g)); });
+
+    var tc = card('常见问题速查', '按症状找：左边是你看到的现象，展开是原因和该看哪个文件。');
+    tc.id = 'helpTrouble';
+    (gd.troubles || []).forEach(function (t) {
+      var d = el('details', 'grp');
+      var sum = el('summary');
+      sum.appendChild(el('span', null, t.title));
+      d.appendChild(sum);
+      var bd = el('div', 'grp-body');
+      if (t.why) bd.appendChild(hint(t.why));
+      (t.items || []).forEach(function (it) {
+        if (it.url) { bd.appendChild(linkChips([it])); return; }
+        if (it.page) {
+          bd.appendChild(buttons([{ text: it.label, sm: true, onClick: function () { go(it.page); } }]));
+          return;
+        }
+        bd.appendChild(pathRow(it));
+      });
+      d.appendChild(bd);
+      tc.appendChild(d);
+    });
+    v.appendChild(tc);
+
+    v.appendChild(repoCard(repo));
+  }
+
   async function pageAdvanced(v) {
     clear(v);
     if (!S.files) {
@@ -2250,6 +2443,8 @@
       S.ours = null;
       render();
     };
+    var star = $('#btnStar');
+    if (star) star.onclick = function () { toast('打开后点页面右上角 ⭐ Star 就能收藏，谢啦！'); };
     $('#btnSave').onclick = saveAll;
     $('#btnDiscard').onclick = function () {
       if (S.pending.size && !confirm('放弃 ' + S.pending.size + ' 项未保存的修改？')) return;

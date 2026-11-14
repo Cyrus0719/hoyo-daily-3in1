@@ -203,6 +203,32 @@ OneDragon 的每个功能是 `config/01/one_dragon/<功能>.yml`，而文件里*
 > 配置文件里有密码（`config/accounts.yaml`、OneDragon 的 `game_account.yml`），界面里一律打码显示。
 > `config/accounts.yaml`、`config/daily_config.yaml`、`config/display_user.json` 都在 `.gitignore` 里，不会进仓库。
 
+### 帮助与排查：路径、日志、上游文档，一键打开
+
+「不知道该看哪个文件」是本项目里最常见的问题。侧栏最后一页 **帮助与排查** 把这些全列出来，点「打开」就直接定位：
+
+| 卡片 | 里面有什么 |
+| --- | --- |
+| 遇到问题先做这三步 | 先看总控日志 → 再看对应引擎今天的日志 → 最后才去上游提 issue（附日志比附截图有用） |
+| 原神 · BetterGI | 一条龙任务 `User\OneDragon\daily.json`、主设置 `User\config.json`、战斗策略目录 `User\AutoFight`、日志 `log\`、**游戏自己的日志** `LocalLow\miHoYo\原神\output_log.txt` |
+| 崩坏：星穹铁道 · 三月七助手 | `config.yaml`、带全部中文注释的 `assets\config\config.example.yaml`、`logs\YYYY-MM-DD.log`、游戏日志 `Player.log` |
+| 绝区零 · OneDragon | `config\01`（game / game_account / notify）、`config\01\one_dragon\*.yml`、`config\auto_battle`、日志 **`.log\log.txt`**（不是 `logs\`）、自带 `docs\运维指南` |
+| 本项目（胶水层） | `logs\daily.log`、`logs\zzz_cli.log`、`logs\config_changes.log`、`logs\login\`（登录失败截图）、`config\backup`、`config\daily_config.yaml` |
+| 常见问题速查 | 8 条最常见的故障：今天没跑 / 原神站着挨打 / 掉登录 / 崩铁不退出 / 绝区零没画面 / 下载更新失败 / 分辨率不是 16:9 / 改了配置没生效，每条都直接给「点哪个文件」「搜哪个关键词」「看哪篇上游文档」 |
+| 关于本项目 | 仓库地址、Star、Issues、最新 Release |
+
+- 路径都是**现读磁盘**的：文件不存在会直接标灰，不会给你一条死链。相对路径按安装目录显示，同时显示大小和修改时间。
+- 打开方式：目录用资源管理器打开，文件直接 `explorer /select` 定位并选中；只能打开安装目录和游戏 `LocalLow` 目录下的路径（写了越界路径会被拒绝）。
+- 三个游戏页底部各有一条「文件在哪、日志在哪」折叠条，只列这个游戏相关的，不用再翻到帮助页。
+
+![帮助与排查](docs/ui/help.png)
+
+### Star 一下
+
+顶栏右上角有 `★ Star`（带实时 star 数，来自 GitHub API），侧栏底部也有一个入口；点开会跳到仓库，页面里再点一次 Star 就收藏完了——**这个项目没人知道，star 是目前唯一能让别人搜到它的信号**。
+
+![常见问题速查](docs/ui/help-faq.png)
+
 ## 配置（`config/daily_config.yaml`）
 
 - `scheduler`：运行顺序、总超时。

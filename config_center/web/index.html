@@ -17,6 +17,8 @@
     <nav id="nav"></nav>
     <div class="side-foot">
       <div id="footState" class="hint">读取中…</div>
+      <a class="side-link" id="sideGithub" href="https://github.com/Cyrus0719/hoyo-daily-3in1" target="_blank"
+         rel="noopener" title="开源在 GitHub，觉得有用就点个 Star">GitHub · ⭐ Star</a>
     </div>
   </aside>
   <main class="main">
@@ -27,6 +29,10 @@
       </div>
       <div class="top-actions">
         <div class="search"><input id="q" type="text" placeholder="搜索当前页设置项…" autocomplete="off"></div>
+        <a id="btnStar" class="btn ghost star" href="https://github.com/Cyrus0719/hoyo-daily-3in1" target="_blank"
+           rel="noopener" title="觉得有用就点个 Star，能让更多人搜到这个项目">
+          <span class="staric">★</span> Star<b id="ghStars"></b>
+        </a>
         <button id="btnReload" class="btn ghost" title="重新读取磁盘上的配置">↻ 刷新</button>
       </div>
     </header>
