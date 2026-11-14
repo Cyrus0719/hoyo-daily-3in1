@@ -13,4 +13,8 @@ _auto_daily.lock
 .venv/
 *.7z
 *.part
+*.bak
+*.bak-*
+_*.py
+_*.mjs
 config/github_token.txt
