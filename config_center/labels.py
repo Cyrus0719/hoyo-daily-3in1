@@ -282,6 +282,17 @@ PATH_LABELS = {
     "display.auto_switch_window": "跑的时候自动切窗口化",
     "display.auto_width": "自动化时窗口宽",
     "display.auto_height": "自动化时窗口高",
+    # 2026-11-14 补：这几个键原来完全没中文，界面上直接显示英文键名
+    "region": "区服",
+    "auto_login": "掉登录自动登录",
+    "do_commissions": "每日委托",
+    "claim_welkin": "领取月卡",
+    "claim_katheryne": "凯瑟琳奖励",
+    "switch_only": "只是开关（不是秘境）",
+    "category": "副本大类",
+    "mode": "运行方式",
+    "proxy": "网络代理",
+    "windowed_value": "窗口化标志值",
 }
 
 # --------------------------------------------------------------------------- 分词字典
@@ -335,6 +346,75 @@ WORDS = {
     "daily_signin": "每日签到", "intel_board": "情报板", "life_on_line": "生活在线",
     "lost_void": "迷失之地", "notorious_hunt": "恶名狩猎", "withered_domain": "枯萎之地",
     "standalone": "独立应用", "app": "应用", "skip": "跳过", "obtain": "获取",
+    # 2026-11-14 补：这三类词原来没收录，导致「自动 switch 窗口」这种半翻译
+    "switch": "切换", "only": "仅", "open": "打开", "close": "关闭",
+    "click": "点击", "press": "按下", "move": "移动", "task": "任务", "tasks": "任务",
+    "panel": "面板", "screen": "屏幕", "resolution": "分辨率", "text": "文本",
+    "source": "来源", "status": "状态", "priority": "优先级", "selected": "选中",
+    "select": "选择", "choose": "选择", "after": "之后", "before": "之前",
+    "ratio": "比例", "predefined": "预设", "color": "颜色", "line": "线", "lines": "行数",
+    "value": "值", "values": "值", "label": "标签", "metrics": "指标",
+    "lifecycle": "生命周期", "detail": "详细", "details": "详细", "mission": "任务",
+    "background": "背景", "shadow": "阴影", "timestamp": "时间戳", "idx": "序号",
+    "completed": "已完成", "complete": "完成", "guide": "引导", "guided": "引导",
+    "quick": "快速", "bot": "机器人", "asset": "资源", "assets": "资源",
+    "claim": "领取", "overlay": "悬浮层", "font": "字体", "device": "设备",
+    "training": "训练", "category": "分类", "mask": "遮罩", "box": "框",
+    "crosshair": "准星", "record": "录制", "artifact": "圣遗物", "artifacts": "圣遗物",
+    "challenge": "挑战", "threads": "线程", "buff": "增益", "option": "选项",
+    "options": "选项", "endpoint": "接口", "extra": "额外", "enemy": "敌人",
+    "failure": "失败", "user": "用户", "scale": "缩放", "border": "边框",
+    "thickness": "粗细", "direction": "方向", "main": "主", "fast": "快速",
+    "hangout": "邀约", "api": "接口", "card": "卡片", "cards": "卡片",
+    "guardian": "护盾", "statue": "神像", "script": "脚本", "scripts": "脚本",
+    "mouse": "鼠标", "base": "基础", "group": "组", "groups": "组", "tab": "标签页",
+    "notorious": "恶名", "hunt": "狩猎", "pip": "源", "store": "商店",
+    "minutes": "分钟", "policy": "策略", "usage": "占用", "memory": "内存",
+    "radius": "半径", "item": "物品", "items": "物品", "sleep": "休眠",
+    "active": "激活", "action": "动作", "cd": "冷却", "factor": "系数",
+    "burst": "爆发", "paimon": "派蒙", "star": "星", "stars": "星",
+    "button": "按钮", "macro": "宏", "error": "错误", "errors": "错误",
+    "webview": "网页视图", "message": "消息", "messages": "消息", "pass": "密码",
+    "target": "目标", "targets": "目标", "repository": "仓库", "region": "区服",
+    "coffee": "咖啡", "ember": "余烬", "currencywars": "货币战争", "scheduled": "定时",
+    "warn": "警告", "warning": "警告", "info": "信息", "output": "输出", "input": "输入",
+    "format": "格式", "version": "版本", "page": "页", "quality": "画质", "fps": "帧率",
+    "frame": "帧", "loop": "循环", "wait": "等待", "debug": "调试", "verbose": "详细输出",
+    "test": "测试", "save": "保存", "load": "载入", "export": "导出", "import": "导入",
+    "log": "日志", "logs": "日志", "file": "文件", "folder": "文件夹", "dir": "目录",
+    "key": "键", "keys": "按键", "token": "令牌", "time": "时间", "timer": "计时",
+    "date": "日期", "weekday": "星期", "month": "月", "year": "年", "push": "推送",
+    "sound": "声音", "volume": "音量", "mute": "静音", "theme": "主题",
+    "dark": "深色", "light": "浅色", "layout": "布局", "content": "内容",
+    "title": "标题", "desc": "描述", "description": "描述", "comment": "注释",
+    "note": "备注", "notes": "备注", "size": "大小", "width": "宽", "height": "高",
+    "position": "位置", "offset": "偏移", "image": "图像", "images": "图像",
+    "icon": "图标", "play": "播放", "pause": "暂停", "stop": "停止",
+    # 2026-11-14 第二批：BetterGI 主配置里剩下的半翻译
+    "id": "ID", "ley": "地脉", "leyline": "地脉", "client": "客户端", "do": "执行",
+    "cost": "开销", "bgi": "BGI", "normal": "普通", "special": "特殊", "exit": "退出",
+    "redeem": "兑换", "feeds": "推送源", "global": "全局", "chat": "聊天", "picture": "图片",
+    "hold": "长按", "specify": "指定", "bonus": "加成", "repo": "仓库", "track": "追踪",
+    "cancel": "取消", "pos": "位置", "from": "来自", "server": "服务器", "send": "发送",
+    "menu": "菜单", "cap": "上限", "allow": "允许", "launcher": "启动器", "build": "构建",
+    "merge": "合并", "link": "链接", "env": "环境", "blood": "血量", "order": "顺序",
+    "capture": "截图", "trigger": "触发", "voice": "语音", "confirm": "确认", "event": "事件",
+    "process": "进程", "prompt": "提示", "fallback": "回退", "tp": "传送", "space": "空格",
+    "refresh": "刷新", "elite": "精英", "visible": "可见", "up": "上", "down": "下",
+    "left": "左", "right": "右", "top": "顶", "bottom": "底", "exp": "经验",
+    "lost": "迷失", "set": "设置", "regular": "常规", "dish": "料理", "adventurers": "冒险家",
+    "seek": "寻找", "ms": "毫秒", "recover": "恢复", "point": "点位", "enhance": "强化",
+    "scroll": "滚动", "channel": "渠道", "method": "方式", "subject": "主题", "object": "对象",
+    "result": "结果", "copy": "复制", "email": "邮箱", "port": "端口", "username": "用户名",
+    "element": "元素", "elemental": "元素", "quest": "任务", "ui": "界面", "restart": "重启",
+    "operation": "操作", "keep": "保留", "full": "完整", "simulated": "模拟", "sign": "签到",
+    "telemetry": "遥测", "dodge": "闪避", "pawnshop": "当铺", "wechat": "微信", "feishu": "飞书",
+    "ding": "钉钉", "wechatwork": "企业微信", "wechatworkbot": "企业微信机器人", "blur": "模糊",
+    "gap": "间距", "column": "列", "row": "行", "cover": "遮蔽", "scaling": "缩放",
+    "family": "字体族", "rect": "矩形", "stroke": "描边", "drawable": "可绘制", "style": "样式",
+    "html": "网页", "current": "当前", "once": "一次", "had": "曾有", "xxtui": "消息推送",
+    "seven": "七圣", "exe": "程序", "uid": "UID", "px": "像素", "py": "纵坐标", "x": "横坐标",
+    "y": "纵坐标", "lv": "等级", "tp": "传送", "num": "数量", "total": "总计",
 }
 
 
@@ -344,17 +424,34 @@ def _tokens(name):
     return [t.lower() for t in re.split(r"[_\W]+", s) if t]
 
 
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+# 这些虚词直接丢掉，翻出来只会让中文更别扭
+_DROP = {"the", "a", "an", "of", "to", "in", "on", "by", "is", "and", "or", "with", "for"}
+
+
 def humanize(name):
-    toks = _tokens(name)
+    """逐词翻译，但拼接时只在「两侧都不是中文」处留空格。
+
+    2026-11-14 修：原来是 " ".join()，于是 "auto_switch_window" 被译成
+    「自动 switch 窗口」这种半中半英的怪串。现在中文之间不加空格，
+    中英之间加一个空格（"GPU 占用"），全部词都没收录时原样返回键名。
+    """
+    toks = [t for t in _tokens(name) if t not in _DROP]
     if not toks:
         return str(name)
     parts = [WORDS.get(t) for t in toks]
     if all(p is None for p in parts):
         return str(name)
     out = []
+    prev_cn = None
     for t, p in zip(toks, parts):
-        out.append(p if p else t)
-    return " ".join(out)
+        piece = p if p else t
+        cn = bool(_CJK.search(piece))
+        if out and not (cn and prev_cn):
+            out.append(" ")
+        out.append(piece)
+        prev_cn = cn
+    return "".join(out)
 
 
 def group_label(path, name, game=""):

@@ -173,6 +173,7 @@
       S.pending.clear();
       updateSaveBar();
       S.summary = null;
+      markSaved();
       await render();
       toast(msgs.join('\n'), 'ok');
     } else {
@@ -562,6 +563,18 @@
 
   function hint(text) { return el('div', 'hint', text); }
 
+  /* 加载中的骨架屏，比一行「读取中…」更像成品 */
+  function skeleton() {
+    var wrap = el('div', 'skwrap');
+    for (var i = 0; i < 3; i++) {
+      var c = el('div', 'skcard');
+      c.appendChild(el('div', 'sk sk-t'));
+      for (var j = 0; j < 3 + i; j++) c.appendChild(el('div', 'sk sk-r'));
+      wrap.appendChild(c);
+    }
+    return wrap;
+  }
+
   function buttons(rows) {
     var wrap = el('div', 'btnrow');
     rows.forEach(function (r) {
@@ -600,10 +613,45 @@
     highlightNav();
   }
 
+  var RUN_OF = {
+    genshin: ['yuanshen.exe', 'bettergi.exe'],
+    starrail: ['starrail.exe', 'march7th assistant.exe'],
+    zzz: ['zenlesszonezero.exe']
+  };
+  var RUN_LABEL = {
+    'yuanshen.exe': '原神', 'bettergi.exe': 'BetterGI',
+    'starrail.exe': '崩铁', 'march7th assistant.exe': '三月七助手',
+    'zenlesszonezero.exe': '绝区零'
+  };
+
+  function runningBanner(page, running) {
+    var old2 = document.getElementById('runWarn');
+    if (old2) old2.parentNode.removeChild(old2);
+    var want = RUN_OF[page];
+    if (!want || !running || !running.length) return;
+    var hit = running.filter(function (n) { return want.indexOf(n) >= 0; });
+    if (!hit.length) return;
+    var names = hit.map(function (n) { return RUN_LABEL[n] || n; }).join('、');
+    var v = $('#view');
+    if (!v) return;
+    var d = el('div', 'runwarn');
+    d.id = 'runWarn';
+    d.appendChild(el('b', null, names + ' 正在运行'));
+    d.appendChild(el('span', null,
+      '：上游程序退出时会把界面里的设置写回配置文件，盖掉你刚改的内容。建议先关掉它再改；' +
+      '现在改也不会丢，只是可能被覆盖一次。'));
+    var x = el('button', 'btn sm ghost', '知道了');
+    x.type = 'button';
+    x.onclick = function () { if (d.parentNode) d.parentNode.removeChild(d); };
+    d.appendChild(x);
+    v.insertBefore(d, v.firstChild);
+  }
+
   function refreshFoot() {
     getJSON('/summary').then(function (s) {
       $('#footState').textContent = '每天 ' + (s.daily_time || '--:--') + ' 自动运行';
       if (s.task && s.task.next) $('#footState').title = '下次运行：' + s.task.next;
+      runningBanner(S.page, s.running || []);
     }).catch(function () {
       $('#footState').textContent = '计划任务未就绪';
     });
@@ -619,6 +667,75 @@
     for (var i = 0; i < as.length; i++) {
       as[i].className = as[i].dataset.page === S.page ? 'on' : '';
     }
+  }
+
+  /* ------------------------------------------------------------------ 页内目录
+     长页面（原神 1.3 万像素、崩铁 2.5 万像素）光靠滚是找不到东西的，
+     这里把每张卡的标题抽出来做成顶栏下面一条可点的目录。 */
+  function tocCards() {
+    var all = document.querySelectorAll('#view .card');
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].querySelector('h2')) out.push(all[i]);
+    }
+    return out;
+  }
+
+  function buildTOC() {
+    var toc = $('#toc');
+    if (!toc) return;
+    clear(toc);
+    var cards = tocCards();
+    if (cards.length < 2) { toc.className = 'toc hidden'; return; }
+    toc.className = 'toc';
+    toc.appendChild(el('span', 'toc-h', '本页 ' + cards.length + ' 块'));
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].id = 'sec' + (i + 1);
+      var t = cards[i].querySelector('h2');
+      var txt = String((t && t.textContent) || ('第 ' + (i + 1) + ' 块'));
+      var a = el('a', null, txt.replace(/\s+/g, ' ').trim());
+      a.dataset.i = String(i);
+      a.onclick = (function (idx) {
+        return function () {
+          var list = tocCards();
+          var c = list[idx];
+          if (!c) return;
+          $('#view').scrollTop = Math.max(0, c.offsetTop - 8);
+          tocSpy();
+        };
+      })(i);
+      toc.appendChild(a);
+    }
+    tocSpy();
+  }
+
+  function tocSpy() {
+    var toc = $('#toc');
+    if (!toc || toc.className.indexOf('hidden') >= 0) return;
+    var cards = tocCards();
+    if (!cards.length) return;
+    var v = $('#view');
+    var line = v.scrollTop + 30;
+    var best = 0;
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].offsetTop <= line) best = i;
+    }
+    var as = toc.querySelectorAll('a');
+    for (var j = 0; j < as.length; j++) {
+      as[j].className = (Number(as[j].dataset.i) === best) ? 'on' : '';
+    }
+  }
+
+  /* 保存成功后顶栏留一个时间戳，避免「到底存没存」的疑问 */
+  function markSaved() {
+    var n = $('#savedAt');
+    if (!n) return;
+    var d = new Date();
+    var hh = ('0' + d.getHours()).slice(-2);
+    var mm = ('0' + d.getMinutes()).slice(-2);
+    n.textContent = '已保存 ' + hh + ':' + mm;
+    n.className = 'saved on';
+    setTimeout(function () { n.className = 'saved'; }, 4000);
   }
 
   function pageFromHash() {
@@ -647,7 +764,7 @@
     if (S.toolsTimer) { clearInterval(S.toolsTimer); S.toolsTimer = null; }
     var v = $('#view');
     clear(v);
-    v.appendChild(el('div', 'hint', '读取中…'));
+    v.appendChild(skeleton());
     try {
       if (p.id === 'setup') await pageSetup(v);
       else if (p.id === 'overview') await pageOverview(v);
@@ -668,6 +785,7 @@
       v.appendChild(c);
     }
     applySearch();
+    buildTOC();
     refreshFoot();
   }
 
@@ -2375,26 +2493,32 @@
     var c = card('自动备份', '每次保存前都会把原文件备份到 config/backup/，每个文件保留最近 30 份。');
     var tb = el('table', 'tb');
     var thr = el('tr');
-    ['时间', '文件', '大小', ''].forEach(function (h) { thr.appendChild(el('th', null, h)); });
+    ['时间', '文件', '所属配置', '大小', ''].forEach(function (h) { thr.appendChild(el('th', null, h)); });
     tb.appendChild(thr);
     if (!b.backups.length) {
       var tr0 = el('tr');
       var td0 = el('td');
-      td0.colSpan = 4;
+      td0.colSpan = 5;
       td0.appendChild(hint('还没有备份。'));
       tr0.appendChild(td0);
       tb.appendChild(tr0);
     }
+    var bySafe = {};
+    S.files.forEach(function (f) { bySafe[String(f.id).replace(/[:/]/g, '_')] = f.label || f.id; });
     b.backups.forEach(function (x) {
+      var own = '';
+      for (var k in bySafe) { if (x.name.indexOf(k + '_') === 0) { own = bySafe[k]; break; } }
       var tr = el('tr');
       tr.appendChild(el('td', null, x.mtime));
       tr.appendChild(el('td', null, x.name));
+      tr.appendChild(el('td', null, own || '—'));
       tr.appendChild(el('td', null, (x.size / 1024).toFixed(0) + ' KB'));
       var td = el('td');
       var btn = el('button', 'btn sm danger', '恢复');
       btn.type = 'button';
       btn.onclick = async function () {
-        if (!confirm('用这份备份覆盖当前文件？\n' + x.name)) return;
+        if (!confirm('恢复到这份备份？\n\n配置：' + (own || x.name) + '\n备份：' + x.name +
+          '\n\n覆盖前会先把当前内容另存一份备份，改坏了还能再恢复回来。')) return;
         var r = await postJSON('/restore', { name: x.name });
         if (fail(r)) return;
         S.treeCache = {};
@@ -2434,6 +2558,7 @@
       if (p && p !== S.page) go(p);
     });
     $('#q').addEventListener('input', applySearch);
+    $('#view').addEventListener('scroll', tocSpy);
     $('#btnReload').onclick = function () {
       if (S.pending.size && !confirm('有 ' + S.pending.size + ' 项未保存，刷新会丢掉，继续？')) return;
       S.pending.clear();
@@ -2445,6 +2570,13 @@
     };
     var star = $('#btnStar');
     if (star) star.onclick = function () { toast('打开后点页面右上角 ⭐ Star 就能收藏，谢啦！'); };
+    var th = $('#btnTheme');
+    if (th) th.onclick = function () {
+      var light = document.documentElement.className.indexOf('light') >= 0;
+      document.documentElement.className = light ? '' : 'light';
+      try { localStorage.setItem('cc-theme', light ? 'dark' : 'light'); } catch (e) {}
+      toast(light ? '已切换到深色' : '已切换到浅色');
+    };
     $('#btnSave').onclick = saveAll;
     $('#btnDiscard').onclick = function () {
       if (S.pending.size && !confirm('放弃 ' + S.pending.size + ' 项未保存的修改？')) return;

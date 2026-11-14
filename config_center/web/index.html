@@ -6,6 +6,7 @@
 <title>HoYo 每日自动化 · 配置中心</title>
 <link rel="icon" href="favicon.ico">
 <link rel="stylesheet" href="style.css">
+<script>try{var t=localStorage.getItem('cc-theme');if(t==='light')document.documentElement.className='light';}catch(e){}</script>
 </head>
 <body>
 <div class="app">
@@ -28,14 +29,17 @@
         <p id="pageSub"></p>
       </div>
       <div class="top-actions">
+        <span id="savedAt" class="saved"></span>
         <div class="search"><input id="q" type="text" placeholder="搜索当前页设置项…" autocomplete="off"></div>
         <a id="btnStar" class="btn ghost star" href="https://github.com/Cyrus0719/hoyo-daily-3in1" target="_blank"
            rel="noopener" title="觉得有用就点个 Star，能让更多人搜到这个项目">
           <span class="staric">★</span> Star<b id="ghStars"></b>
         </a>
+        <button id="btnTheme" class="btn ghost theme" title="切换深色 / 浅色">◐</button>
         <button id="btnReload" class="btn ghost" title="重新读取磁盘上的配置">↻ 刷新</button>
       </div>
     </header>
+    <div id="toc" class="toc hidden"></div>
     <div id="view" class="view"></div>
   </main>
 </div>

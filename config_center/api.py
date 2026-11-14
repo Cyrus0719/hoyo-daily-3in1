@@ -92,6 +92,30 @@ def _parse_daily_log(limit=4000):
     return out, last_ts
 
 
+_RUN_CACHE = {"ts": 0.0, "names": []}
+_RUN_NAMES = ("yuanshen.exe", "starrail.exe", "zenlesszonezero.exe",
+              "bettergi.exe", "march7th assistant.exe")
+
+
+def _running_procs():
+    """当前在跑的游戏/上游工具（5 秒缓存，失败返回空，不影响页面）。"""
+    now = time.time()
+    if now - _RUN_CACHE["ts"] < 5:
+        return _RUN_CACHE["names"]
+    names = []
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                             timeout=8, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        low = out.stdout.decode("mbcs", "ignore").lower()
+        for n in _RUN_NAMES:
+            if n in low:
+                names.append(n)
+    except Exception:  # noqa: BLE001
+        names = []
+    _RUN_CACHE.update({"ts": now, "names": names})
+    return names
+
+
 def summary():
     info = task_sched.task_info()
     runs, last_ts = _parse_daily_log()
@@ -127,6 +151,7 @@ def summary():
         "tools_state": {"running": st.get("running"), "phase": st.get("phase", ""),
                         "percent": st.get("percent", 0), "tool": st.get("tool", "")},
         "last_activity": last_ts,
+        "running": _running_procs(),
         "job": dict(JOB),
     }
 
