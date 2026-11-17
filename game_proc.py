@@ -115,16 +115,42 @@ def wait_gone(exe: str, timeout_s: int = 90) -> bool:
     return not running(exe)
 
 
-def close(exe: str, grace_s: int = 45, force_after_s: int = 180) -> bool:
+# ★ 2026-11-17 事故：连 WM_CLOSE 都不能发给"刚启动"的游戏。
+#   当天 12:44 崩铁的登录态数据还是好的（1304 字节），12:59:40 我们为了"预登录"
+#   把游戏拉起来、13 秒后又 WM_CLOSE 掉，13:00:12 再启动时游戏直接判"没有记住的账号"
+#   → 弹手机号验证码登录页，记住的账号被清成 24 字节的空值。
+#   也就是说：启动头一分钟内被关掉，游戏来不及把登录数据写完，下一个实例就当它不存在。
+#   所以现在先等它"长大"到 min_age_s 秒再动手（最多等 max_wait_s 秒）。
+_MIN_AGE_S = 60
+_MAX_WAIT_S = 150
+
+
+def close(exe: str, grace_s: int = 45, force_after_s: int = 180,
+          min_age_s: int = None, max_wait_s: int = None) -> bool:
     """温和关闭游戏进程。True = 进程已经不在（或本来就没开）。
 
-    详细规则见模块文档：先 WM_CLOSE 优雅退出；只有「存活 >= force_after_s 秒」
-    的进程才允许 /F，刚启动的进程一律不强杀。"""
+    详细规则见模块文档：先等到进程"长大"（min_age_s，默认 60 秒），再 WM_CLOSE
+    优雅退出；只有「存活 >= force_after_s 秒」的进程才允许 /F，刚启动的一律不强杀。"""
     if not exe:
         return True
     if not running(exe):
         return True
     t0 = time.time()
+    min_age_s = _MIN_AGE_S if min_age_s is None else min_age_s
+    max_wait_s = _MAX_WAIT_S if max_wait_s is None else max_wait_s
+    end = time.time() + max_wait_s
+    while min_age_s > 0 and time.time() < end:
+        if not running(exe):
+            return True
+        a = [x for x in ages(exe) if x is not None]
+        if not a or min(a) >= min_age_s:
+            break
+        log.info("[proc] %s 才启动 %.0f 秒，先等它到 %d 秒再关"
+                 "（启动头一分钟里被关掉会写坏登录态，2026-11-17 实测）",
+                 exe, min(a), min_age_s)
+        time.sleep(3)
+    if not running(exe):
+        return True
     young = [a for a in ages(exe) if a is not None]
     log.info("[proc] %s 正在运行（已存活 %s 秒），先发 WM_CLOSE 让它自己退",
              exe, ("%.0f" % min(young)) if young else "未知")

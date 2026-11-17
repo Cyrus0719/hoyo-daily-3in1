@@ -259,6 +259,12 @@ class StarRailAdapter:
         #   对已运行的全屏游戏同样拉不动）→「游戏分辨率不正确」→ 它自己 terminate+重启 →
         #   12:49:46 起「截图失败：没有找到游戏窗口」×10 → 我们判必死杀进程，整轮 ok=False。
         kill_game_if_running(self.cfg.get("client_path", ""))
+        # ※ 2026-11-17 已【删除】"预登录"（自己把游戏开起来、登录、再关掉）：
+        #   11-17 12:59:40 它把 StarRail.exe 拉起来，13 秒后 WM_CLOSE，紧接着三月七又启动
+        #   一次 —— 13:00 游戏 SDK 直接判"没有记住的账号"，HKCU 里 MIHOYOSDK_ADL_0 从
+        #   1304 字节掉成 24 字节空值（logs/adl_state.log 有前后指纹）。
+        #   即：启动头一分钟里被关掉会把登录数据写坏。现在一道预登录都不做，
+        #   兜底只交给下面那个后台 watch 线程（游戏已经开着时填表，绝不关它）。
         log.info("[March7th] 启动完整运行 main ...")
         # 提权感知启动：定时任务(/RL HIGHEST)已是管理员 -> 直接启动【无 UAC】；
         # 手动运行时非提权 -> runas（弹一次 UAC）。程序自带 pyuac，双保险一致。
@@ -278,7 +284,7 @@ class StarRailAdapter:
         if login_helper is not None and self.cfg.get("auto_login", True):
             try:
                 login_helper.watch("StarRail.exe", "starrail", stop_event=self._login_stop,
-                                   timeout_s=3600, interval_s=10)
+                                   timeout_s=3600, interval_s=3)
             except Exception as e:   # noqa: BLE001
                 log.warning("[March7th] 登录兜底线程没起来（不影响主流程）: %s", e)
         # 窗口兜底：整场盯着游戏窗口，任何时候不是 16:9 就拉回 1920x1080
@@ -294,6 +300,7 @@ class StarRailAdapter:
 
         2026-11-09 之前这里只会死等进程退出，于是登录过期的那次白挂了 29 分钟。"""
         end = time.time() + timeout_s
+        t_begin = time.time()
         stall_s = float(self.cfg.get("stall_minutes", 15)) * 60
         last_size = _log_size()
         last_progress = time.time()
@@ -320,7 +327,9 @@ class StarRailAdapter:
                 _scan_today_log()
                 self.stop()
                 return False
-            time.sleep(10)
+            # 前 5 分钟 3 秒看一次：三月七从"游戏切前台"到判「账号登录过期」只有 16 秒左右，
+            # 10 秒一轮经常等它已经重启过一轮才发现（2026-11-16 用户看到的就是"反复退出又启动"）。
+            time.sleep(3 if (time.time() - t_begin) < 300 else 10)
         log.error("[March7th] 等待超时（%d 分钟），判定失败", timeout_s // 60)
         return False
 

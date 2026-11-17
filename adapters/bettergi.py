@@ -686,6 +686,10 @@ class BetterGIAdapter:
                         "BetterGI 会接管这个已在运行的游戏，通常也能正常进世界")
                                      # 先关游戏：让它自己从登录界面进游戏，
                                      # 否则用户把游戏停在某个界面时 BetterGI 会一直等（实测 10/3-10/5 空等一小时）
+        # ※ 2026-11-17 已【删除】"预登录"（自己把游戏拉起来登录、再关掉）：
+        #   它会先让游戏启动十几秒、然后 WM_CLOSE，紧接着上游又启动一次 —— 实测这正是
+        #   "记住的账号被清掉"的元凶（崩铁 12:44 的登录数据还是好的，13:00 就变成空值、
+        #   弹手机验证码页）。登录兜底改由下面的后台 watch 线程做：游戏已经开着时填表。
         _log_baseline()              # 记日志基线：只看本次新增的内容
         self._run_started_at = time.time()
         self._game_log_base = _game_log_size()   # 原神自己日志的基线（查本地快速登录缓存）
@@ -706,8 +710,10 @@ class BetterGIAdapter:
         self._login_stop = threading.Event()
         if login_helper is not None and self.cfg.get("auto_login", True):
             try:
+                # 间隔 3 秒（2026-11-16）：BetterGI 从"游戏到前台"到自己放弃只有几十秒，
+                # 10 秒一轮经常一整轮都没看到登录界面，于是它把游戏杀掉重开。
                 login_helper.watch("YuanShen.exe", "genshin", stop_event=self._login_stop,
-                                   timeout_s=timeout_s + 600, interval_s=10)
+                                   timeout_s=timeout_s + 600, interval_s=3)
             except Exception as e:   # noqa: BLE001
                 log.warning("[BetterGI] 登录兜底线程没起来（不影响主流程）: %s", e)
         self._run_one_dragon(t, timeout_s, 0, None)

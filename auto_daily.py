@@ -113,6 +113,7 @@ def run_game(game_key, games_cfg, dry_run=False):
 
     disp = g.get("display", {})
     snap = None
+    adl_watch = None
     adapter = build_adapter(game_key, g, targets)
     try:
         if disp.get("auto_switch_window", True):
@@ -124,15 +125,32 @@ def run_game(game_key, games_cfg, dry_run=False):
                                       int(disp.get("auto_width", 1920)),
                                       int(disp.get("auto_height", 1080)))
             log.info("[%s] 已切换为窗口化", game_key)
+        # 登录态监视：跑这一款期间每 10 秒比一次"记住的账号"指纹，
+        # 一变就在日志里写明是谁被动过（2026-11-17 靠它抓到"预登录清空崩铁登录态"）
+        try:
+            import login_helper
+            adl_watch = login_helper.start_adl_watch(game_key)
+        except Exception:
+            adl_watch = None
         adapter.start()
         log.info("[%s] 引擎已启动，等待完成…", game_key)
         ok = adapter.wait(timeout_s=int(g.get("timeout_minutes", 90) * 60))
         log.info("[%s] 执行结束 ok=%s", game_key, ok)
+        try:
+            import login_helper
+            login_helper.snapshot_adl("after-%s(%s)" % (game_key, "ok" if ok else "fail"))
+        except Exception:
+            pass
         return "ok" if ok else "timeout"
     except Exception as e:
         log.exception("[%s] 执行异常: %s", game_key, e)
         return "error"
     finally:
+        try:
+            if adl_watch is not None:
+                adl_watch.stop()
+        except Exception:
+            pass
         try:
             adapter.stop()
         except Exception:
@@ -229,6 +247,13 @@ def _log_tool_updates():
 def main():
     setup_log()
     _log_tool_updates()
+    # 记住的账号数据指纹：每次运行开头记一次（= 上一轮结束到现在的状态），
+    # 用来区分"是本机数据被改"还是"服务器不认 token"。见 logs/adl_state.log。
+    try:
+        import login_helper
+        login_helper.snapshot_adl("run-start")
+    except Exception:
+        pass
     if not _acquire_single_instance_lock():
         log.warning("已有 auto_daily 实例在运行，本次退出（防止重复启动游戏）")
         return 0
