@@ -120,6 +120,41 @@ def _fatal_hit(text: str) -> str:
     return ""
 
 
+# ★ 2026-11-19 事故：07:24:43 启动 → 07:24:56「窗口已切换到前台」→ 07:25:38 进程无声消失，
+#   日志只有两行、没有任何"停止/完成"横幅。当时判定只看「日志里没有未完成特征」→ ok=True，
+#   于是游戏被我们关掉，用户看到的就是"崩铁闪了一下就没了"。
+#   从此：① 三月七的控制台输出（PyInstaller 的 traceback 只打到这里）全部落盘；
+#          ② 进程退出必须看退出码 + 跑够时长 + 有完成痕迹；③ 早期退出自动重跑一趟。
+M7A_CONSOLE = BASE / "logs" / "m7a_console.log"
+M7A_DONE_MARKS = ("开拓力", "游戏终止", "任务完成", "已完成", "全部完成")
+EARLY_EXIT_S = 240          # 小于这个时长就退出，正常一轮不可能干完
+
+
+def _pids(name: str):
+    """按镜像名取 PID。返回 [] = 确认没在跑；返回 None = tasklist 自己失败了（别当"已退出"）。"""
+    try:
+        r = _run_hidden(["tasklist", "/NH", "/FI", "IMAGENAME eq " + name],
+                        text=True, errors="replace")
+    except Exception:
+        return None
+    out = r.stdout or ""
+    pids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.lower().startswith(name.lower()):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    if pids:
+        return pids
+    if not out.strip():
+        return None if r.returncode != 0 else []
+    if "没有运行" in out or "No tasks" in out:
+        return []
+    return None
+
+
 def _scan_today_log() -> None:
     """把"本次没干完"的痕迹写进 daily.log：开拓力起止 + 未完成/跳过特征。"""
     try:
@@ -238,6 +273,8 @@ class StarRailAdapter:
         self.cfg = cfg
         self.targets = [t for t in targets if t.get("enabled", True)]
         self.proc = None
+        self._console = None      # 三月七控制台输出的落盘句柄（见 _spawn()）
+        self._t0 = 0.0
         self._guard = None
         self._login_stop = None   # 登录兜底线程的停止信号（见 start()）
         self._base = {"name": "", "size": 0}
@@ -266,17 +303,7 @@ class StarRailAdapter:
         #   即：启动头一分钟里被关掉会把登录数据写坏。现在一道预登录都不做，
         #   兜底只交给下面那个后台 watch 线程（游戏已经开着时填表，绝不关它）。
         log.info("[March7th] 启动完整运行 main ...")
-        # 提权感知启动：定时任务(/RL HIGHEST)已是管理员 -> 直接启动【无 UAC】；
-        # 手动运行时非提权 -> runas（弹一次 UAC）。程序自带 pyuac，双保险一致。
-        if self._is_admin():
-            # CREATE_NO_WINDOW：别弹黑窗口（GUI 程序本来也不该有控制台，
-            # 但 2026-11-09 的绝区零就是被"冒出来的控制台被关掉"以 0xC000013A 打死的，统一处理）
-            subprocess.Popen([str(EXE), "main"], cwd=str(M7A_DIR),
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            log.info("[March7th] 管理员上下文中直接启动（无 UAC）")
-        else:
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", str(EXE), "main", str(M7A_DIR), 1)
-            log.info("[March7th] 非提权上下文 runas 启动（UAC 一次）")
+        self._spawn()
         # 【登录兜底】三月七自己没有账号密码登录能力：一遇到「账号登录过期」就原地卡死
         #   （2026-11-09 白挂 29 分钟，把绝区零挤掉）。这里起后台线程盯游戏窗口，
         #   认出登录界面就用账号密码登录一次（绝不用手机验证码）。
@@ -290,24 +317,90 @@ class StarRailAdapter:
         # 窗口兜底：整场盯着游戏窗口，任何时候不是 16:9 就拉回 1920x1080
         self._guard = win_guard.watch_async("starrail")
 
+    def _spawn(self):
+        """启动三月七，并把它的控制台输出落盘（异常 traceback / 截图报错都在里面）。
+
+        提权感知：定时任务(/RL HIGHEST)已是管理员 -> 直接启动【无 UAC】；
+        手动运行时非提权 -> runas（弹一次 UAC）。程序自带 pyuac，双保险一致。"""
+        try:
+            M7A_CONSOLE.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(M7A_CONSOLE, "a", encoding="utf-8", errors="replace")
+            fh.write("\n===== %s 启动三月七 =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            fh.flush()
+        except Exception as e:   # noqa: BLE001
+            fh = None
+            log.warning("[March7th] 控制台输出落盘失败（不影响运行）: %s", e)
+        self._console = fh
+        self._t0 = time.time()
+        if self._is_admin():
+            # CREATE_NO_WINDOW：别弹黑窗口（GUI 程序本来也不该有控制台，
+            # 但 2026-11-09 的绝区零就是被"冒出来的控制台被关掉"以 0xC000013A 打死的，统一处理）
+            self.proc = subprocess.Popen([str(EXE), "main"], cwd=str(M7A_DIR),
+                                         stdout=fh, stderr=subprocess.STDOUT,
+                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            log.info("[March7th] 管理员上下文中直接启动（无 UAC）")
+        else:
+            self.proc = None
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", str(EXE), "main", str(M7A_DIR), 1)
+            log.info("[March7th] 非提权上下文 runas 启动（UAC 一次）")
+
     def _running(self) -> bool:
-        r = _run_hidden(["tasklist", "/FI", "IMAGENAME eq March7th Assistant.exe"],
-                           capture_output=True, text=True)
-        return "March7th Assistant.exe" in r.stdout
+        """还在跑吗。tasklist 自己失败（返回 None）时按"还在跑"处理，宁可多等一轮。"""
+        pids = _pids("March7th Assistant.exe")
+        return True if pids is None else bool(pids)
 
     def wait(self, timeout_s: int = 3600):
-        """等三月七跑完：进程退出=完成；但"必死错误"和"日志停长"要立刻收工。
+        """等三月七跑完。进程退出 ≠ 干完了（2026-11-19 的教训）。
 
-        2026-11-09 之前这里只会死等进程退出，于是登录过期的那次白挂了 29 分钟。"""
+        那天 07:24:43 启动 → 07:24:56「窗口已切换到前台」→ 07:25:38 进程就没了，
+        当天日志只有两行、没有任何"停止/完成"横幅；旧判定只看「日志里没有未完成特征」，
+        于是记成 ok=True，游戏随即被我们关掉 —— 用户看到的就是"崩铁闪了一下就没了"。
+        现在：早期退出 / 异常退出都判失败，并且自动重跑一趟。"""
+        for attempt in (0, 1):
+            ok, code = self._wait_once(timeout_s)
+            if ok:
+                return True
+            if attempt >= 1 or code != "early":
+                return False
+            log.warning("[March7th] 这一趟没干成（%s）—— 重跑一趟（第 2 次）", code)
+            try:
+                # 只杀引擎：stop() 会连登录兜底和窗口兜底线程一起停掉，重跑就没人看窗口了
+                self._kill_engine()
+                game_proc.close("StarRail.exe", grace_s=45, force_after_s=180)
+                game_proc.wait_gone("StarRail.exe", 90)
+            except Exception as e:   # noqa: BLE001
+                log.warning("[March7th] 重跑前关游戏出问题: %s", e)
+            time.sleep(20)
+            self._base = _log_baseline()
+            try:
+                self._spawn()
+            except Exception as e:   # noqa: BLE001
+                log.error("[March7th] 重跑启动失败: %s", e)
+                return False
+        return False
+
+    def _wait_once(self, timeout_s: int):
+        """盯一趟。返回 (ok, code)，code ∈ done / fatal / stall / early / timeout。"""
         end = time.time() + timeout_s
         t_begin = time.time()
         stall_s = float(self.cfg.get("stall_minutes", 15)) * 60
         last_size = _log_size()
         last_progress = time.time()
+        misses = 0
         while time.time() < end:
-            if not self._running():
-                _scan_today_log()   # 进程退出 ≠ 干完了：把"没干完"的痕迹写进 daily.log
-                return True   # 进程退出 = 完成（after_finish=Exit）
+            pids = _pids("March7th Assistant.exe")
+            if pids is None:
+                # tasklist 自己也失败了：绝不当成"引擎退出了"，否则会把正在跑的这一趟误杀
+                time.sleep(3)
+                continue
+            if not pids:
+                # 进程消失要连续 3 次（中间隔 1.5 秒）才算真的退出
+                misses += 1
+                if misses < 3:
+                    time.sleep(1.5)
+                    continue
+                return self._after_exit(t_begin)
+            misses = 0
             hit = _fatal_hit(_log_text_after(self._base))
             if hit:
                 log.error("[March7th] 引擎报致命错误『%s』—— 判定失败并立即结束进程"
@@ -316,7 +409,7 @@ class StarRailAdapter:
                     log.error("[March7th] %s", M7A_FATAL_HINT)
                 _scan_today_log()
                 self.stop()
-                return False
+                return False, "fatal"
             size = _log_size()
             if size != last_size:
                 last_size = size
@@ -326,17 +419,50 @@ class StarRailAdapter:
                           (time.time() - last_progress) / 60)
                 _scan_today_log()
                 self.stop()
-                return False
-            # 前 5 分钟 3 秒看一次：三月七从"游戏切前台"到判「账号登录过期」只有 16 秒左右，
-            # 10 秒一轮经常等它已经重启过一轮才发现（2026-11-16 用户看到的就是"反复退出又启动"）。
+                return False, "stall"
             time.sleep(3 if (time.time() - t_begin) < 300 else 10)
         log.error("[March7th] 等待超时（%d 分钟），判定失败", timeout_s // 60)
-        return False
+        return False, "timeout"
+
+    def _after_exit(self, t_begin: float):
+        """进程退出之后：看退出码 + 跑够时长 + 完成痕迹，别把"半路死掉"记成成功。"""
+        elapsed = time.time() - t_begin
+        rc = None
+        if self.proc is not None:
+            try:
+                rc = self.proc.poll()
+            except Exception:   # noqa: BLE001
+                rc = None
+        text = _log_text_after(self._base)
+        has_done = any(m in text for m in M7A_DONE_MARKS)
+        log.info("[March7th] 引擎进程已退出（退出码 %s，本趟 %.0f 秒，日志 %d 字）",
+                 rc, elapsed, len(text))
+        _scan_today_log()   # 进程退出 ≠ 干完了：把"没干完"的痕迹写进 daily.log
+        if elapsed < EARLY_EXIT_S and not has_done:
+            log.error("[March7th] 引擎只跑了 %.0f 秒就退出，日志里没有任何完成痕迹 —— 判失败"
+                      "（完整控制台输出见 logs/%s）", elapsed, M7A_CONSOLE.name)
+            return False, "early"
+        if rc not in (None, 0) and not has_done:
+            log.error("[March7th] 引擎异常退出（退出码 %s）且没有完成痕迹 —— 判失败"
+                      "（完整控制台输出见 logs/%s）", rc, M7A_CONSOLE.name)
+            return False, "early"
+        return True, "done"
 
     def stop(self):
         if self._guard is not None:
             self._guard.set()
         if self._login_stop is not None:
             self._login_stop.set()
-        _run_hidden(["taskkill", "/IM", "March7th Assistant.exe", "/F"], capture_output=True)
-        _run_hidden(["taskkill", "/IM", "March7thAssistant.exe", "/F"], capture_output=True)
+        if self._console is not None:      # 控制台输出句柄：关了它三月七的 traceback 也没了
+            try:
+                self._console.flush()
+                self._console.close()
+            except Exception:   # noqa: BLE001
+                pass
+            self._console = None
+        self._kill_engine()
+
+    def _kill_engine(self):
+        """只结束三月七自己（不动游戏、不停兜底线程）—— 重跑一趟时用。"""
+        for name in ("March7th Assistant.exe", "March7thAssistant.exe"):
+            _run_hidden(["taskkill", "/IM", name, "/F"], capture_output=True)

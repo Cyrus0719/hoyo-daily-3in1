@@ -103,8 +103,31 @@ def _client_rect(hwnd):
     return tl.x, tl.y, w, h
 
 
-def _foreground(hwnd) -> bool:
+# 2026-11-19 实测的原文是「189*****80，欢迎进入游戏」（不是"欢迎回来"），
+# 所以除了几个"欢迎…"句式，再认一条：带打码账号 + 「进入游戏」的那一行。
+_WELCOME_WORDS = ("欢迎进入游戏", "欢迎回来", "歡迎回來", "欢迎回到", "欢迎登入",
+                  "点击进入游戏画面")
+_WELCOME_MASKED = ("*****", "＊＊＊＊＊", "****")
+def _is_welcome(boxes) -> bool:
+    """「189*****80，欢迎进入游戏」这种【已经登录成功】的过场页。
+
+    2026-11-19 事故：崩铁这一页的按钮文字就是「进入游戏」，被 STRONG_HINTS 当成了登录框
+    → 每 3 秒抢一次前台、跑一次 OCR、还要去填账号密码；三月七同时在截图识别，
+    07:25:35 那一轮之后它就无声退出了（日志只到「窗口已切换到前台」）。"""
+    for b in boxes:
+        t = _txt(b)
+        if any(w in t for w in _WELCOME_WORDS):
+            return True
+        if "进入游戏" in t and any(m in t for m in _WELCOME_MASKED):
+            return True
+    return False
+
+
+def _foreground(hwnd, force: bool = True) -> bool:
     """把窗口真的提到前台，并【确认】成功。
+
+    force=False：只承认"它本来就是前台"，绝不抢焦点（给周期性探测用，
+    2026-11-19 起探测不再每 3 秒顶掉用户正在用的窗口）。
 
     2026-11-16 事故：崩铁那趟的"登录界面截图"其实截的是桌面 —— 三月七的黑窗口和浏览器
     盖在游戏上面。SetForegroundWindow 在后台进程里会被 Windows 的前台锁静默拒绝，于是
@@ -114,15 +137,26 @@ def _foreground(hwnd) -> bool:
     try:
         if u.GetForegroundWindow() == hwnd:
             return True
+        if not force:
+            return False
         u.ShowWindow(hwnd, 9)          # SW_RESTORE
         time.sleep(0.15)
-        if u.GetForegroundWindow() != hwnd:
-            u.keybd_event(0x12, 0, 0, 0)      # ALT down
-            u.keybd_event(0x12, 0, 2, 0)      # ALT up
+        # ① 先好好要一次（不按键）—— 大多数情况这就够了
+        u.SetForegroundWindow(hwnd)
+        u.BringWindowToTop(hwnd)
+        for _ in range(4):
             time.sleep(0.12)
-            u.SetForegroundWindow(hwnd)
-            u.BringWindowToTop(hwnd)
-        for _ in range(8):
+            if u.GetForegroundWindow() == hwnd:
+                return True
+        # ② 还不行才用 Alt 解锁前台锁。★ 这是【全局合成按键】，只在真要填表这一刻按一次：
+        #    2026-11-19 那次它每 3 秒按一次 ALT，07:25:36 之后三月七就无声退出了 ——
+        #    合成 ALT 会激活别人窗口的菜单栏，绝不能再周期性发。
+        u.keybd_event(0x12, 0, 0, 0)      # ALT down
+        u.keybd_event(0x12, 0, 2, 0)      # ALT up
+        time.sleep(0.12)
+        u.SetForegroundWindow(hwnd)
+        u.BringWindowToTop(hwnd)
+        for _ in range(6):
             time.sleep(0.15)
             if u.GetForegroundWindow() == hwnd:
                 return True
@@ -131,9 +165,12 @@ def _foreground(hwnd) -> bool:
         return False
 
 
-def _grab(hwnd, path: Path):
-    """截客户区。拿不到前台就返回 None（宁可这轮不判断，也不要截错窗口）。"""
-    if not _foreground(hwnd):
+def _grab(hwnd, path: Path, raise_: bool = True):
+    """截客户区。拿不到前台就返回 None（宁可这轮不判断，也不要截错窗口）。
+
+    raise_=False：周期性探测【绝不抢前台】—— 用户正在别的程序里时直接跳过这一轮。
+    真正要填表时才 raise_=True（那一刻必须让游戏到前台才打得了字）。"""
+    if not _foreground(hwnd, force=raise_):
         return None
     rect = _client_rect(hwnd)
     if not rect:
@@ -254,6 +291,10 @@ def _center(box):
 
 
 def is_login_screen(boxes) -> bool:
+    # ★ 2026-11-19：「欢迎回来 / 进入游戏」是【登录成功之后】的过场页，不是登录框。
+    #   崩铁这一页的按钮文字跟登录框的提交按钮一模一样，认错了就会一直去填表。
+    if _is_welcome(boxes):
+        return False
     strong = _pick(boxes, STRONG_HINTS)
     if strong:
         return True
@@ -671,8 +712,9 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                     continue
                 tag = time.strftime("%Y%m%d-%H%M%S")
                 shot = SHOT_DIR / ("%s_%s_probe.png" % (game, tag))
-                if not _grab(hwnd, shot):
-                    # 拿不到前台（游戏窗口被别的窗口盖着）—— 这轮跳过，不要 OCR 别人的画面
+                if not _grab(hwnd, shot, raise_=False):
+                    # 不是前台（游戏窗口被别的窗口盖着 / 用户在干别的）—— 这轮跳过，
+                    # 绝不抢焦点、也不 OCR 别人的画面
                     time.sleep(interval_s)
                     continue
                 boxes = ocr.run(shot)
