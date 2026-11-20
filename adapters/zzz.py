@@ -41,14 +41,21 @@ INSTANCE = "1"
 #   我们照样报了 ok=True（跟 BetterGI 那类假成功一个毛病）。
 # 一次完整的成功运行，日志里一定有「执行成功 返回状态 全部结束」。
 ZZZ_OK_MARK = "全部结束"
-ZZZ_FAIL_PATTERNS = (
-    "未获取到游戏截图",        # 游戏窗口在，但截不到图（窗口正在重建/启动中）
-    "游戏窗口未找到",          # 截图时窗口句柄没了
-    "执行出错",
+# 2026-11-20：今天绝区零其实完整跑完了（672.8 秒、退出码 0、07:45:55 跑到「全部结束」），
+# 只因为开局检测窗口时闪过 1 次「未获取到游戏截图」就被判成失败 —— 那是 OneDragon 自己在
+# 重试的抖动，不是没干活（用户反馈"其它的倒是正常"也印证了这一点）。
+# 所以把"真失败"和"抖动"分开：真失败永远判负；抖动只要最终跑到「全部结束」且次数很少，只记 WARNING。
+ZZZ_FATAL_PATTERNS = (
     "暂停启动",
     "未配置账号密码",          # OneDragon 的账号密码登录没配（掉登录时走不通）
-    "返回状态 异常",
+    "返回状态 异常",            # 某一步真的以异常状态收尾（不是重试能盖过去的）
 )
+# 抖动类：允许在跑到「全部结束」的前提下出现，但超过上限仍判负
+ZZZ_FLICKER_LIMITS = {
+    "未获取到游戏截图": 5,      # 游戏窗口在，但截不到图（窗口正在重建/启动中）
+    "游戏窗口未找到": 5,        # 截图时窗口句柄还没建好
+    "执行出错": 10,
+}
 
 
 def _cli_log_size() -> int:
@@ -69,22 +76,38 @@ def _cli_text_after(base: int) -> str:
 
 
 def _finish_check(base: int) -> bool:
-    """退出码 0 也要看日志：有没有失败特征、有没有跑到「全部结束」。"""
+    """退出码 0 也要看日志：有没有真失败、有没有跑到「全部结束」、抖动多不多。"""
     text = _cli_text_after(base)
     if not text.strip():
         log.error("[zzz] OneDragon 这次日志一行没写 —— 判定为启动阶段崩溃")
         return False
-    hits = {}
-    for p in ZZZ_FAIL_PATTERNS:
+    fatal = {}
+    for p in ZZZ_FATAL_PATTERNS:
         n = text.count(p)
         if n:
-            hits[p] = n
-    if hits:
-        log.error("[zzz] OneDragon 日志有失败特征（本次没跑完）: %s", hits)
+            fatal[p] = n
+    flicker = {}
+    for p in ZZZ_FLICKER_LIMITS:
+        n = text.count(p)
+        if n:
+            flicker[p] = n
+    if fatal:
+        log.error("[zzz] OneDragon 日志有失败特征（本次没跑完）: %s", fatal)
+        if flicker:
+            log.error("[zzz] 期间的抖动: %s", flicker)
         return False
     if ZZZ_OK_MARK not in text:
         log.error("[zzz] OneDragon 退出码是 0，但日志里没有「%s」—— 判定没跑完", ZZZ_OK_MARK)
+        if flicker:
+            log.error("[zzz] 期间的抖动: %s", flicker)
         return False
+    over = {p: n for p, n in flicker.items() if n > ZZZ_FLICKER_LIMITS[p]}
+    if over:
+        log.error("[zzz] 抖动超过上限（跑到「全部结束」但过程不干净）: %s（上限 %s）",
+                  over, {p: ZZZ_FLICKER_LIMITS[p] for p in over})
+        return False
+    if flicker:
+        log.warning("[zzz] 期间有可自愈的抖动（已跑到「全部结束」，按成功处理）: %s", flicker)
     log.info("[zzz] 日志检查通过：跑到「%s」且无失败特征", ZZZ_OK_MARK)
     return True
 

@@ -62,6 +62,54 @@ ERR_WORDS = ("密码错误", "账号或密码", "帐号或密码", "账号不存
              "频繁", "锁定", "失败", "错误", "过期")
 
 
+# ---- 登录截图的保留策略 ------------------------------------------------------
+# 2026-11-20：watch() 每 3 秒截一张探测图，一周下来 logs/login 里堆了 630 张 / 1.1GB。
+# 这些只是排查用的临时证据，留最近几天就够 —— 起床跑完自己就清。
+SHOT_KEEP_DAYS = 3
+SHOT_KEEP_MB = 150
+
+
+def _prune_shots(keep_days: float = None, keep_mb: float = None) -> int:
+    """清掉过期的登录截图：先按天数，再按总大小（从最老的删起）。返回删除数量。"""
+    days = SHOT_KEEP_DAYS if keep_days is None else keep_days
+    limit_mb = SHOT_KEEP_MB if keep_mb is None else keep_mb
+    try:
+        files = []
+        for p in SHOT_DIR.iterdir():
+            if p.is_file() and p.suffix.lower() == ".png":
+                st = p.stat()
+                files.append([st.st_mtime, st.st_size, p])
+    except Exception:
+        return 0
+    deleted = 0
+    cut = time.time() - days * 86400
+    keep = []
+    for item in files:
+        if item[0] < cut:
+            try:
+                item[2].unlink()
+                deleted += 1
+            except Exception:
+                keep.append(item)
+        else:
+            keep.append(item)
+    total = sum(i[1] for i in keep)
+    if total > limit_mb * 1048576:
+        keep.sort()          # 最老的先删
+        for item in keep:
+            if total <= limit_mb * 1048576:
+                break
+            try:
+                item[2].unlink()
+                total -= item[1]
+                deleted += 1
+            except Exception:
+                pass
+    if deleted:
+        log.info("[login] 清理了 %d 张过期登录截图（保留 %g 天 / %g MB）", deleted, days, limit_mb)
+    return deleted
+
+
 # ---- 账号密码 ----------------------------------------------------------------
 def load_accounts() -> dict:
     try:
@@ -525,10 +573,14 @@ def _gold_count(shot, box, h: int) -> int:
         im = Image.open(str(shot)).convert("RGB")
     except Exception:
         return -1
-    x1 = max(0, box["x1"] - int(3.0 * h))
-    x2 = min(im.width, box["x1"] + int(2.2 * h))
-    y1 = max(0, box["y1"] - int(0.35 * h))
-    y2 = min(im.height, box["y2"] + int(0.35 * h))
+    # ★ 2026-11-20：原来框取到 x1 右侧 2.2 个字高，正好把《用户协议》那条橙色链接
+    #   也算进来；协议页（白底正文）在那块区域也能凑够 20 个"金色"像素 → 误判"已经勾上了"。
+    #   现在只数圆圈左右一小块：已勾 213、未勾 0、协议页 9（阈值 20 能分开）。
+    cy = (box["y1"] + box["y2"]) // 2
+    x1 = max(0, box["x1"] - int(1.2 * h))
+    x2 = min(im.width, box["x1"] + int(1.3 * h))
+    y1 = max(0, cy - int(0.6 * h))
+    y2 = min(im.height, cy + int(0.6 * h))
     n = 0
     for y in range(y1, y2):
         for x in range(x1, x2):
@@ -538,34 +590,110 @@ def _gold_count(shot, box, h: int) -> int:
     return n
 
 
-def _tick_agreement(hwnd, ox: int, oy: int, boxes, shot, uniq: str = ""):
+# ---- 协议页：点了《用户协议》链接会全屏打开一个网页 ----------------------
+# ★ 2026-11-20 事故：勾选协议时先点了【文字中心】，那是《用户协议》超链接 ——
+#   一点就全屏打开协议网页，游戏卡在这一页两分钟，我们又把"登录框看不见了"
+#   当成"登录成功"。协议页本身没有登录框，必须能识别、能退出来。
+_PROTO_WORDS = ("用户协议", "隐私政策", "服务协议", "条款", "协议", "生效", "更新日期")
+
+
+def _is_protocol_page(boxes, width: int = 0) -> bool:
+    """认「用户协议/隐私政策」那种全屏网页。"""
+    if not boxes:
+        return False
+    if _pick(boxes, ("进入游戏", "验证码", "输入密码", "请输入密码", "忘记密码"), min_score=0.4):
+        return False
+    if is_login_screen(boxes):
+        return False
+    joined = "".join(_txt(b) for b in boxes)
+    if len(joined) < 80:
+        return False
+    hits = sum(1 for k in _PROTO_WORDS if k in joined)
+    if hits < 2:
+        return False
+    if width:
+        wide = [b for b in boxes if (b["x2"] - b["x1"]) > 0.5 * width]
+        return len(wide) >= 3
+    return len(boxes) >= 6
+
+
+def _close_protocol(hwnd, ox: int, oy: int, ocr=None, uniq: str = "") -> bool:
+    """把协议页退掉：先按 ESC（游戏自己提示"按ESC后重试"），不行再点左上角的 ✕。"""
+    import pyautogui  # noqa: PLC0415
+
+    rect = _client_rect(hwnd) or (0, 0, 0, 0)
+    w = rect[2] - rect[0]
+    h = rect[3] - rect[1]
+    for attempt in (1, 2):
+        pyautogui.press("esc")
+        time.sleep(1.0)
+        shot = SHOT_DIR / ("%s_%s_proto_esc%d.png" % ("login", uniq, attempt))
+        if not _grab(hwnd, shot):
+            return False
+        if ocr is None:
+            return True
+        boxes = ocr.run(shot)
+        if not _is_protocol_page(boxes, w):
+            log.info("[login] 协议页已用 ESC 退出")
+            return True
+        if w and h:
+            x = ox + int(w * 0.035)
+            y = oy + int(h * 0.030)
+            log.info("[login] ESC 没退出协议页，改点左上角关闭（%d,%d）", x, y)
+            _click(x, y)
+            time.sleep(1.0)
+            shot2 = SHOT_DIR / ("%s_%s_protox%d.png" % ("login", uniq, attempt))
+            if _grab(hwnd, shot2):
+                if not _is_protocol_page(ocr.run(shot2), w):
+                    log.info("[login] 协议页已关闭")
+                    return True
+    log.warning("[login] 协议页关不掉（已存截图 %s）", SHOT_DIR)
+    return False
+
+
+# 圆圈中心相对"文字框左边 x1"的偏移（单位：字高）。
+# 2026-11-20 用真实截图量过：崩铁 x1=682 圆圈中心 696（0.56h），原神 x1=684 圆圈中心 695（0.55h）。
+# 全部候选都 < +1.0h：离《用户协议》链接（≥1.5h）还有距离，再怎么错也点不到链接上。
+_AGREE_X_STEPS = (0.55, 0.35, 0.75, 0.15, -0.15)
+
+
+def _tick_agreement(hwnd, ox: int, oy: int, boxes, shot, uniq: str = "", ocr=None):
     """勾选『同意《用户协议》和《隐私政策》』，并回头验证真的勾上了。
 
-    2026-11-16 从原神登录框截图确认：文字左边有个圆圈，不勾的话「进入游戏」
-    点了没有任何反应 —— 我们的自动登录就卡在这一步。
-    ① 先看是不是已经勾上了（金色像素）；② 点一下协议文字（整行一般是 label，会联动）；
-    ③ 没勾上就再点圆圈本身（圆圈左边缘大约在文字框 x1，中心再右移半个字高）；
-    ④ 用金色像素复核，返回是否真的勾上。"""
+    ★ 2026-11-20：只点文字左边那个圆圈，【绝不点文字】—— 文字是超链接。
+      点完立刻用金色像素复核；万一还是点开了，识别到协议页就退出来再继续。"""
     agree = _pick(boxes, ("同意",), exclude_any=("已同意", "不同意"), min_score=0.25)
     if not agree:
+        log.warning("[login] 没找到『同意《用户协议》』那一行，跳过勾选")
         return False
     box = agree[0]
-    h = max(14, box["y2"] - box["y1"])
+    h = max(12, box["y2"] - box["y1"])
     cy = (box["y1"] + box["y2"]) // 2
     if _gold_count(shot, box, h) >= 20:
         log.info("[login] 『%s』已经勾上了", _txt(box)[:18])
         return True
-    tries = ((_center(box)[0], cy, "文字"),
-             (box["x1"] + int(0.6 * h), cy, "圆圈"))
-    for tx, ty, what in tries:
-        log.info("[login] 勾选『%s』（点%s）", _txt(box)[:18], what)
-        _click(ox + tx, oy + ty)
+    rect = _client_rect(hwnd) or (0, 0, 0, 0)
+    w = rect[2] - rect[0]
+    deadline = time.time() + 12
+    for i, k in enumerate(_AGREE_X_STEPS):
+        if time.time() > deadline:
+            break
+        tx = box["x1"] + int(k * h)
+        log.info("[login] 勾选『%s』（点圆圈第 %d 次，屏幕 %d,%d，不点文字）",
+                 _txt(box)[:18], i + 1, ox + tx, oy + cy)
+        _click(ox + tx, oy + cy)
         time.sleep(0.6)
-        shot2 = SHOT_DIR / ("%s_agree%s.png" % ("login", uniq))
-        if _grab(hwnd, shot2):
-            if _gold_count(shot2, box, h) >= 20:
-                log.info("[login] 协议已勾上")
-                return True
+        shot2 = SHOT_DIR / ("%s_agree%s_%d.png" % ("login", uniq, i + 1))
+        if not _grab(hwnd, shot2):
+            continue
+        if _gold_count(shot2, box, h) >= 20:
+            log.info("[login] 协议已勾上")
+            return True
+        if ocr is not None and _is_protocol_page(ocr.run(shot2), w):
+            log.warning("[login] 点到协议链接、页面被点开了 → 退出协议页再继续")
+            if _close_protocol(hwnd, ox, oy, ocr, uniq):
+                continue
+            return False
     log.warning("[login] 协议勾选没生效（金色像素没出现），继续试登录")
     return False
 
@@ -587,12 +715,21 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
         x, y = _center(box)
         return ox + x, oy + y
 
+    width = rect[2] - rect[0]
+
     shot = SHOT_DIR / ("%s_%s_0.png" % (game, tag))
     if not _grab(hwnd, shot):
         return False, "截不到窗口"
     boxes = ocr.run(shot)
     if not boxes:
         return False, "OCR 没读出文字"
+
+    # 0) 上一轮要是不小心把协议页点开了，先退出来，别在协议页上乱点
+    if _is_protocol_page(boxes, width):
+        log.warning("[login] 画面停在协议页，先关掉它")
+        if _close_protocol(hwnd, ox, oy, ocr, tag):
+            _grab(hwnd, shot)
+            boxes = ocr.run(shot) or boxes
 
     # 1) 验证码登录页 → 先切到「账号密码登录」
     pwd_field = _find_password_field(boxes)
@@ -632,7 +769,7 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
         boxes_ag = ocr.run(shot_ag)
         if boxes_ag:
             boxes = boxes_ag
-        _tick_agreement(hwnd, ox, oy, boxes, shot_ag, uniq=tag)
+        _tick_agreement(hwnd, ox, oy, boxes, shot_ag, uniq=tag, ocr=ocr)
     else:
         log.warning("[login] 截不到窗口，跳过协议勾选")
 
@@ -646,21 +783,48 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
         import pyautogui
         pyautogui.press("enter")
 
-    # 5) 等结果
+    # 5) 等结果 —— 登录框消失 ≠ 登录成功（可能只是协议页顶在最前面）
+    #    ★ 2026-11-20 实测：07:25:31 提交时画面正停在协议页，07:25:40 就"看不见登录框了"，
+    #      于是被判成"登录成功"，游戏在协议页上干等了两分钟。现在要求：
+    #      连续两次都不是登录框、也不是协议页，才算成功。
     deadline = time.time() + max_wait_s
+    t_submit = time.time()
+    clean = 0
+    retried = False
     while time.time() < deadline:
-        time.sleep(6)
+        time.sleep(3)
         shot = SHOT_DIR / ("%s_%s_wait.png" % (game, tag))
         if not _grab(hwnd, shot):
             return False, "等待过程中窗口消失"
         boxes_w = ocr.run(shot)
+        if _is_protocol_page(boxes_w, width):
+            log.warning("[login] 提交后又冒出协议页 → 先关掉它再继续等")
+            _close_protocol(hwnd, ox, oy, ocr, tag)
+            clean = 0
+            continue
         if _has_sms_prompt(boxes_w):
             return False, "需要手机验证码（按要求不做），请手动登录一次"
         err = _has_error(boxes_w)
         if err:
             return False, "登录失败: %s" % err
-        if not is_login_screen(boxes_w):
-            return True, "登录成功（登录界面已消失）"
+        if is_login_screen(boxes_w):
+            clean = 0
+            # 登录框还在：八成是「同意」没勾上，「进入游戏」点了没反应 → 补勾一次再提交（只补一次）
+            if not retried and time.time() - t_submit > 20:
+                retried = True
+                log.warning("[login] 点了进入游戏没反应，补勾协议后再提交一次")
+                _tick_agreement(hwnd, ox, oy, boxes_w, shot, uniq=tag + "r", ocr=ocr)
+                btn2 = _find_login_button(boxes_w, pwd_field)
+                if btn2 is not None:
+                    _click(*screen(btn2))
+                else:
+                    import pyautogui  # noqa: PLC0415
+                    pyautogui.press("enter")
+                t_submit = time.time()
+            continue
+        clean += 1
+        if clean >= 2:
+            return True, "登录成功（登录界面已消失，画面不是协议页）"
     return False, "等了 %d 秒登录界面还在" % max_wait_s
 
 
@@ -694,6 +858,7 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
     done = threading.Event()
 
     def _loop():
+        _prune_shots()
         ocr = Ocr()
         tried = 0
         max_try = 2
@@ -719,6 +884,29 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                     continue
                 boxes = ocr.run(shot)
                 if is_login_screen(boxes):
+                    # ★ 2026-11-20：登录框刚冒出来时【先别动手】。
+                    #   游戏可能正在拿"记住的账号"自动登录；我们一上来就点「账号密码」
+                    #   切换登录方式，等于把这次自动登录打断 —— 当天 07:25:15 我们点了
+                    #   那个标签，07:25:18 注册表里的账号就被清成 24 字节空值。
+                    #   所以先等它一下：等得起就等 20 秒，账号本来就已经空了的只等 6 秒。
+                    grace = _login_grace(game)
+                    log.warning("[login] %s 掉登录了（记住的账号 %d 字节），先等 %d 秒看它自己能不能登进去",
+                                game, _adl_len(game), grace)
+                    t_wait = time.time()
+                    auto = False
+                    while time.time() - t_wait < grace:
+                        time.sleep(2)
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                        shot_g = SHOT_DIR / ("%s_%s_grace.png" % (game, tag))
+                        if not _grab(hwnd, shot_g, raise_=False):
+                            continue
+                        if not is_login_screen(ocr.run(shot_g)):
+                            auto = True
+                            break
+                    if auto:
+                        log.info("[login] %s 登录框自己消失了（游戏自己登进去了），不动手", game)
+                        continue
                     account, password = get_account(game)
                     if not account:
                         log.warning("[login] %s 需要登录，但 config/accounts.yaml 没配账号密码", game)
@@ -792,6 +980,28 @@ def _adl_map() -> dict:
             else:
                 out["%s.%s" % (key, tag)] = "%d:%s" % (len(v), hashlib.sha1(v).hexdigest()[:10])
     return out
+
+
+_ADL_SENTINEL_LEN = 100   # ≤100 字节 = "没有记住的账号"的空值哨兵（实测 24 字节）
+
+
+def _adl_len(game: str) -> int:
+    """某个游戏当前"记住的账号"有多少字节（-1 = 没有这个值）。"""
+    v = _adl_map().get("%s.dl_0" % game, "none")
+    if v in ("none", "missing"):
+        return -1
+    try:
+        return int(v.split(":")[0])
+    except ValueError:
+        return -1
+
+
+def _login_grace(game: str) -> int:
+    """看到登录框后先等几秒再动手。
+
+    账号还在（>100 字节）→ 等 20 秒，给它自己用记住的账号登进去的机会；
+    账号已经被清成空值 → 只等 6 秒，别白白拖着三月七。"""
+    return 20 if _adl_len(game) > _ADL_SENTINEL_LEN else 6
 
 
 def adl_fingerprint() -> str:
