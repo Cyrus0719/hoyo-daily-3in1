@@ -161,7 +161,8 @@ def _snap_list(game: str) -> list:
 def save_snapshot(game: str, tag: str = ""):
     """当前值健康就留一份快照；已存在就跳过。"""
     vals = read_all(game)
-    if classify(vals) not in ("good", "big", "small"):
+    # 只留"健康"的：太长（big）的本身就会把游戏搞坏，不配当快照。
+    if classify(vals) != "good":
         return None
     n = main_size(vals)
     if n < MIN_GOOD:
@@ -248,6 +249,9 @@ def check_and_repair(game: str, dry: bool = False, log=None) -> dict:
     if kind in ("missing", "empty"):
         _log("warning", "[登录态] %s 的「记住的账号」已经被游戏清空（%d 字节），"
                         "准备用最近一份好快照恢复" % (cn, main_size(vals)))
+    elif kind == "small":
+        _log("warning", "[登录态] %s 的「记住的账号」只剩 %d 字节（正常 1300 以上，"
+                        "多半是写了一半），按坏的恢复" % (cn, main_size(vals)))
     elif kind == "big":
         _log("warning", "[登录态] %s 的「记住的账号」已经长到 %d 字节"
                         "（实测 2200 就会解析失败），先恢复到一份更小的快照" % (cn, main_size(vals)))
