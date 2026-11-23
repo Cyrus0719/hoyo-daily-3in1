@@ -125,6 +125,17 @@ def run_game(game_key, games_cfg, dry_run=False):
                                       int(disp.get("auto_width", 1920)),
                                       int(disp.get("auto_height", 1080)))
             log.info("[%s] 已切换为窗口化", game_key)
+        # 登录态守护（2026-11-23 新增）：游戏自己把「记住的账号」(MIHOYOSDK_ADL*)
+        # 写坏/写空时，用最近一份又新又小的快照恢复；健康时顺手留一份快照。
+        # 查明的机制：这个值每次启动游戏会变长，长到游戏自己解析不了就整段清空。
+        try:
+            import adl_guard
+            _adl = adl_guard.check_and_repair(game_key, log=log)
+            if _adl.get("action") != "none":
+                log.warning("[%s] 登录态守护：动作=%s 快照=%s", game_key,
+                            _adl.get("action"), _adl.get("snapshot") or "-")
+        except Exception as e:
+            log.warning("[%s] 登录态守护失败（不影响本次运行）: %s", game_key, e)
         # 登录态监视：跑这一款期间每 10 秒比一次"记住的账号"指纹，
         # 一变就在日志里写明是谁被动过（2026-11-17 靠它抓到"预登录清空崩铁登录态"）
         try:
@@ -160,6 +171,12 @@ def run_game(game_key, games_cfg, dry_run=False):
         if not kill_game(g.get("client_path")):
             log.warning("[%s] 游戏进程没能优雅关闭（见上一行警告）；仍然恢复屏幕设置，"
                         "之后由收尾保险再检查一次", game_key)
+        # 游戏退干净后再留一份登录态快照（退出时游戏还会回写一次，所以放在 kill 之后）
+        try:
+            import adl_guard
+            adl_guard.save_snapshot(game_key, "after-run")
+        except Exception:
+            pass
         # 引擎/游戏都退干净后，给适配器一个收尾机会（例如绝区零换回用户的全屏显示档）
         try:
             hook = getattr(adapter, "after_kill", None)
