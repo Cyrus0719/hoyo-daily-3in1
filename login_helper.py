@@ -54,6 +54,9 @@ STRONG_HINTS = ("账号密码登录", "帐号密码登录", "手机验证码登�
                 # 占位提示是「输入手机号/邮箱」，提交按钮写的是「进入游戏」。
                 "请输入手机", "输入手机号", "手机号/邮箱", "邮箱/手机号", "进入游戏")
 WEAK_HINTS = ("登录", "账号", "帐号", "密码", "验证码")
+# 登录框上才有的附属元素（表单填满后靠它们认人，见 is_login_screen）
+_LOGIN_ACCESSORIES = ("忘记密码", "用户协议", "隐私政策", "保留登录记录", "手机短信",
+                      "TapTap", "注册", "验证码")
 # ★ 2026-11-16：米游社登录页常驻「手机短信 / TapTap」两个切换标签，
 #   原来的 SMS_WORDS 里有裸的「短信」，于是刚点完「进入游戏」、页面还在淡出时
 #   就会被判成"需要手机验证码"，白丢一次登录机会。现在只认真正的验证码提示。
@@ -213,31 +216,143 @@ def _foreground(hwnd, force: bool = True) -> bool:
         return False
 
 
-def _grab(hwnd, path: Path, raise_: bool = True):
+def _virtual_screen():
+    """整块桌面（含多显示器）的边界，用来把截图区域裁到屏幕里。"""
+    try:
+        left = u.GetSystemMetrics(76)    # SM_XVIRTUALSCREEN
+        top = u.GetSystemMetrics(77)     # SM_YVIRTUALSCREEN
+        w = u.GetSystemMetrics(78)       # SM_CXVIRTUALSCREEN
+        h = u.GetSystemMetrics(79)       # SM_CYVIRTUALSCREEN
+        if w > 0 and h > 0:
+            return left, top, left + w, top + h
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _grab(hwnd, path: Path, raise_: bool = True, tries: int = 3):
     """截客户区。拿不到前台就返回 None（宁可这轮不判断，也不要截错窗口）。
 
     raise_=False：周期性探测【绝不抢前台】—— 用户正在别的程序里时直接跳过这一轮。
-    真正要填表时才 raise_=True（那一刻必须让游戏到前台才打得了字）。"""
+    真正要填表时才 raise_=True（那一刻必须让游戏到前台才打得了字）。
+
+    ★ 2026-11-23：以前 ImageGrab 会把 OSError("screen grab failed") 抛到上层，
+      整条兜底线程当场结束 —— 当天 09:13:51 就是这么把"等登录结果"卡死在半路的。
+      现在截图失败只算"这一轮看不清"：重试 3 次，还不行就返回 None。"""
     if not _foreground(hwnd, force=raise_):
         return None
+    global _CUR_HWND
+    _CUR_HWND = int(hwnd or 0)
     rect = _client_rect(hwnd)
     if not rect:
         return None
     from PIL import ImageGrab
     x, y, w, h = rect
-    img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(str(path))
-    return path
+    box = (x, y, x + w, y + h)
+    vs = _virtual_screen()
+    if vs:
+        box = (max(box[0], vs[0]), max(box[1], vs[1]),
+               min(box[2], vs[2]), min(box[3], vs[3]))
+    if box[2] - box[0] <= 0 or box[3] - box[1] <= 0:
+        return None
+    for i in range(max(1, tries)):
+        try:
+            img = ImageGrab.grab(bbox=box, all_screens=True)
+        except Exception as e:  # noqa: BLE001
+            if i + 1 >= max(1, tries):
+                log.warning("[login] 截图失败（%s），这一轮先跳过", e)
+                return None
+            time.sleep(0.5)
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            img.save(str(path))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[login] 保存截图失败（%s）", e)
+            return None
+        return path
+    return None
+
+
+def _ocr_safe(ocr, shot):
+    """OCR 失败只当"这一轮读不出来"，绝不让异常把兜底线程带走。"""
+    if ocr is None or not shot:
+        return []
+    try:
+        return ocr.run(shot) or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("[login] OCR 失败（%s），这一轮先跳过", e)
+        return []
+
+
+# 最近一次截图/操作对应的游戏窗口；_click 每次点击前用它把前台再抢回来一次
+_CUR_HWND = 0
 
 
 def _click(x: int, y: int):
+    # ★ 2026-11-23：勾协议点中了、1 秒后点「进入游戏」却没反应 —— 那一秒里前台被别的
+    #   窗口拿走了。现在每一次点击之前都重新确认前台还在游戏上（失败也照样点，只是记一笔）。
+    if _CUR_HWND:
+        try:
+            if not _foreground(_CUR_HWND, force=True):
+                log.warning("[login] 点击 (%d,%d) 前抢不回游戏前台，仍然点一次", x, y)
+        except Exception:  # noqa: BLE001
+            pass
     u.SetCursorPos(int(x), int(y))
     time.sleep(0.15)
     u.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.06)
     u.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
     time.sleep(0.35)
+
+
+def _window_at(x: int, y: int) -> int:
+    """屏幕 (x,y) 上压着的是哪个根窗口。用来确认我们点的是游戏，不是别人的窗口。"""
+    try:
+        u.WindowFromPoint.argtypes = [wt.POINT]
+        u.WindowFromPoint.restype = ctypes.c_void_p
+        u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        u.GetAncestor.restype = ctypes.c_void_p
+        pt = wt.POINT(int(x), int(y))
+        h = u.WindowFromPoint(pt)
+        if not h:
+            return 0
+        root = u.GetAncestor(ctypes.c_void_p(h), 2)   # GA_ROOT
+        return int(root or h)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _click_window(hwnd, x, y, label: str = "") -> bool:
+    """点之前把游戏【再】顶一次前台，并确认 (x,y) 上确实是游戏窗口。
+
+    2026-11-23 事故：09:11:29 勾协议那一下点中了，1 秒后点「进入游戏」却毫无反应 ——
+    最可能就是那一秒里前台被别的窗口拿走了，点击落到别人身上。"""
+    want = int(hwnd or 0)
+    top = _window_at(x, y)
+    if want and top and top != want:
+        log.warning("[login] 点「%s」之前，(%.0f,%.0f) 上压着别的窗口(0x%x)，先把游戏顶回前台",
+                    label or "按钮", x, y, top)
+    _foreground(hwnd, force=True)
+    time.sleep(0.12)
+    top = _window_at(x, y)
+    ok = True
+    if want and top and top != want:
+        ok = False
+        log.warning("[login] 顶了前台之后 (%.0f,%.0f) 上还是别的窗口(0x%x)，照样点一下试试",
+                    x, y, top)
+    _click(x, y)
+    return ok
+
+
+def _frame_sig(path) -> str:
+    """一张截图的粗略指纹：用来判断"点了之后画面有没有变"。"""
+    try:
+        from PIL import Image
+        img = Image.open(str(path)).convert("L").resize((32, 18))
+        return hashlib.sha1(img.tobytes()).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _paste(text: str):
@@ -345,7 +460,18 @@ def is_login_screen(boxes) -> bool:
         return False
     strong = _pick(boxes, STRONG_HINTS)
     if strong:
-        return True
+        # ★ 2026-11-23：只凭一个「进入游戏」不能再算登录框 —— 登录成功后的过场页
+        #   （"已进入游戏"之类）也会命中这个词。要求至少两条不同的登录特征，
+        #   或者命中「输入手机号 / 输入密码 / 验证码」这类输入框占位文字。
+        texts = [_txt(b) for b in strong]
+        if len(set(texts)) >= 2:
+            return True
+        joined = " ".join(texts) + " " + " ".join(_txt(b) for b in boxes)
+        if any(k in joined for k in ("输入", "手机号", "邮箱", "密码", "验证码")):
+            return True
+        # 表单填满之后占位文字就没了（账号是一串数字、密码是圆点），只剩「进入游戏」
+        # + 这些附属元素。它们只出现在登录框上，据此保住"这是登录框"的判断。
+        return any(k in joined for k in _LOGIN_ACCESSORIES)
     weak = {_txt(b) for b in _pick(boxes, WEAK_HINTS)}
     return len(weak) >= 2 and any("登录" in t for t in weak)
 
@@ -698,6 +824,71 @@ def _tick_agreement(hwnd, ox: int, oy: int, boxes, shot, uniq: str = "", ocr=Non
     return False
 
 
+# 点按钮的位置微调（单位：字高）：先正中，再上下各偏 0.22，最后回正中
+_SUBMIT_OFFSETS = ((0.0, 0.0), (0.0, 0.22), (0.0, -0.22), (0.0, 0.0))
+
+
+def _submit_login(hwnd, ox, oy, boxes, pwd_field, ocr, tag, game: str,
+                  account: str = "", tries: int = 4, refill=None) -> bool:
+    """点「进入游戏」并【确认画面真的变了】。
+
+    ★ 2026-11-23 事故：09:11:29 勾协议那次点中了，1 秒后点「进入游戏」却毫无反应。
+      旧代码只会"补勾协议再点一次"，然后干等到超时 —— 用户看到的正是
+      "填完信息、点了同意，就不点登录了"。
+      现在每点一次都对比前后两帧：画面变了=点中了；没变=换位置/换方式再来。"""
+    shot_b = SHOT_DIR / ("%s_%s_sub.png" % (game, tag))
+    shot_a = SHOT_DIR / ("%s_%s_sub2.png" % (game, tag))
+    cur = list(boxes or [])
+    for i in range(max(1, tries)):
+        if i >= 2 and refill is not None:
+            log.warning("[login] 前两次点击画面都没变化，重新填一遍密码再试")
+            try:
+                refill()
+            except Exception as e:  # noqa: BLE001
+                log.warning("[login] 重填密码失败: %s", e)
+            if _grab(hwnd, shot_b):
+                cur = _ocr_safe(ocr, shot_b) or cur
+        btn = _find_login_button(cur, pwd_field)
+        sig0 = ""
+        if btn is not None:
+            cx, cy = _center(btn)
+            bh = max(1, btn["y2"] - btn["y1"])
+            dx, dy = _SUBMIT_OFFSETS[i % len(_SUBMIT_OFFSETS)]
+            sx = int(round(ox + cx + dx * bh))
+            sy = int(round(oy + cy + dy * bh))
+            if _grab(hwnd, shot_b):
+                sig0 = _frame_sig(shot_b)
+            log.info("[login] 点「%s」提交登录（第 %d/%d 次，屏幕 %d,%d，账号 %s）",
+                     _txt(btn), i + 1, tries, sx, sy, _mask(account))
+            _click_window(hwnd, sx, sy, label=_txt(btn))
+        else:
+            log.warning("[login] 没找到登录按钮，改用回车提交（第 %d/%d 次，账号 %s）",
+                        i + 1, tries, _mask(account))
+            _foreground(hwnd, force=True)
+            try:
+                import pyautogui  # noqa: PLC0415
+                pyautogui.press("enter")
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(2.0)
+        if not _grab(hwnd, shot_a):
+            continue
+        boxes_a = _ocr_safe(ocr, shot_a)
+        if not boxes_a:
+            continue
+        if not is_login_screen(boxes_a):
+            log.info("[login] 提交后登录框已经不见了（第 %d 次点击生效）", i + 1)
+            return True
+        sig1 = _frame_sig(shot_a)
+        if sig0 and sig1 and sig0 != sig1:
+            log.info("[login] 第 %d 次点击后画面有变化（说明点中了，登录多半在进行中）", i + 1)
+        else:
+            log.warning("[login] 第 %d 次点击后画面毫无变化 —— 这一下没落到按钮上", i + 1)
+        cur = boxes_a
+        time.sleep(1.0)
+    return False
+
+
 def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
               shot_tag: str = "", max_wait_s: int = 150):
     """在已经确认是登录界面的窗口上，走一遍账号密码登录。返回 (ok, message)。
@@ -708,7 +899,15 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
     tag = shot_tag or time.strftime("%Y%m%d-%H%M%S")
     rect = _client_rect(hwnd)
     if not rect:
-        return False, "窗口尺寸异常"
+        # 游戏刚起来时客户区可能还是 0×0（2026-11-23 崩铁就是这样：直接报
+        # 「窗口尺寸异常」放弃了，那天两次机会都白丢）。现在先等最多 8 秒。
+        for _ in range(16):
+            time.sleep(0.5)
+            rect = _client_rect(hwnd)
+            if rect:
+                break
+    if not rect:
+        return False, "窗口尺寸异常（等了 8 秒客户区还是 0×0）"
     ox, oy = rect[0], rect[1]
 
     def screen(box):
@@ -773,30 +972,45 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
     else:
         log.warning("[login] 截不到窗口，跳过协议勾选")
 
-    # 4) 点登录（找不到按钮就按回车）
-    btn = _find_login_button(boxes, pwd_field)
-    if btn is not None:
-        log.info("[login] 点「%s」提交登录（账号 %s）", _txt(btn), _mask(account))
-        _click(*screen(btn))
-    else:
-        log.warning("[login] 没找到登录按钮，改用回车提交（账号 %s）", _mask(account))
-        import pyautogui
-        pyautogui.press("enter")
+    # 4) 点「进入游戏」—— 点完要确认画面真的变了（见 _submit_login 的说明）
+    def _refill():
+        p = SHOT_DIR / ("%s_%s_refill.png" % (game, tag))
+        if not _grab(hwnd, p):
+            return
+        b = _ocr_safe(ocr, p)
+        if not b:
+            return
+        pf2 = _find_password_field(b) or pwd_field
+        _fill_password(hwnd, ox, oy, pf2, password, ocr, game, tag)
+
+    submitted = _submit_login(hwnd, ox, oy, boxes, pwd_field, ocr, tag, game,
+                              account=account, tries=4, refill=_refill)
+    if not submitted:
+        log.warning("[login] 四次点击都没让画面起变化，下面继续重试提交")
 
     # 5) 等结果 —— 登录框消失 ≠ 登录成功（可能只是协议页顶在最前面）
     #    ★ 2026-11-20 实测：07:25:31 提交时画面正停在协议页，07:25:40 就"看不见登录框了"，
     #      于是被判成"登录成功"，游戏在协议页上干等了两分钟。现在要求：
     #      连续两次都不是登录框、也不是协议页，才算成功。
     deadline = time.time() + max_wait_s
-    t_submit = time.time()
+    t_last = time.time()
     clean = 0
-    retried = False
+    submits = 0
+    grab_fail = 0
     while time.time() < deadline:
         time.sleep(3)
         shot = SHOT_DIR / ("%s_%s_wait.png" % (game, tag))
         if not _grab(hwnd, shot):
-            return False, "等待过程中窗口消失"
-        boxes_w = ocr.run(shot)
+            # 以前这里直接 return "等待过程中窗口消失"；现在截不到只是"看不清"，
+            # 连续 6 次（约 18 秒）都截不到才放弃。
+            grab_fail += 1
+            if grab_fail >= 6:
+                return False, "连续 %d 次截不到窗口（窗口没了 / 分辨率变了）" % grab_fail
+            continue
+        grab_fail = 0
+        boxes_w = _ocr_safe(ocr, shot)
+        if not boxes_w:
+            continue
         if _is_protocol_page(boxes_w, width):
             log.warning("[login] 提交后又冒出协议页 → 先关掉它再继续等")
             _close_protocol(hwnd, ox, oy, ocr, tag)
@@ -809,21 +1023,24 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
             return False, "登录失败: %s" % err
         if is_login_screen(boxes_w):
             clean = 0
-            # 登录框还在：八成是「同意」没勾上，「进入游戏」点了没反应 → 补勾一次再提交（只补一次）
-            if not retried and time.time() - t_submit > 20:
-                retried = True
-                log.warning("[login] 点了进入游戏没反应，补勾协议后再提交一次")
-                _tick_agreement(hwnd, ox, oy, boxes_w, shot, uniq=tag + "r", ocr=ocr)
-                btn2 = _find_login_button(boxes_w, pwd_field)
-                if btn2 is not None:
-                    _click(*screen(btn2))
-                else:
-                    import pyautogui  # noqa: PLC0415
-                    pyautogui.press("enter")
-                t_submit = time.time()
+            # 登录框还在 = 刚才那一下没生效。每 15 秒重来一轮（最多再提交 3 次），
+            # 不再"只补勾一次就干等到超时"。
+            if submits < 3 and time.time() - t_last > 15:
+                submits += 1
+                log.warning("[login] 登录框还在，第 %d 次重试提交（重新补勾协议 + 重点按钮）",
+                            submits + 1)
+                _tick_agreement(hwnd, ox, oy, boxes_w, shot,
+                                uniq="%sr%d" % (tag, submits), ocr=ocr)
+                if _grab(hwnd, shot):
+                    boxes_w = _ocr_safe(ocr, shot) or boxes_w
+                if _submit_login(hwnd, ox, oy, boxes_w, pwd_field, ocr,
+                                 "%s-s%d" % (tag, submits), game,
+                                 account=account, tries=2, refill=_refill):
+                    log.info("[login] 重试提交后登录框消失了，继续等进游戏")
+                t_last = time.time()
             continue
         clean += 1
-        if clean >= 2:
+        if clean >= 3:
             return True, "登录成功（登录界面已消失，画面不是协议页）"
     return False, "等了 %d 秒登录界面还在" % max_wait_s
 
@@ -861,7 +1078,7 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
         _prune_shots()
         ocr = Ocr()
         tried = 0
-        max_try = 2
+        max_try = 3
         t_begin = time.time()
         deadline = time.time() + timeout_s
         try:
@@ -882,7 +1099,7 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                     # 绝不抢焦点、也不 OCR 别人的画面
                     time.sleep(interval_s)
                     continue
-                boxes = ocr.run(shot)
+                boxes = _ocr_safe(ocr, shot)
                 if is_login_screen(boxes):
                     # ★ 2026-11-20：登录框刚冒出来时【先别动手】。
                     #   游戏可能正在拿"记住的账号"自动登录；我们一上来就点「账号密码」
@@ -901,7 +1118,7 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                         shot_g = SHOT_DIR / ("%s_%s_grace.png" % (game, tag))
                         if not _grab(hwnd, shot_g, raise_=False):
                             continue
-                        if not is_login_screen(ocr.run(shot_g)):
+                        if not is_login_screen(_ocr_safe(ocr, shot_g)):
                             auto = True
                             break
                     if auto:
@@ -914,7 +1131,10 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                         continue
                     log.warning("[login] %s 掉登录了，自动用账号密码登录（账号 %s）", game, _mask(account))
                     tried += 1
-                    ok, msg = try_login(hwnd, game, account, password, ocr, shot_tag=tag)
+                    try:
+                        ok, msg = try_login(hwnd, game, account, password, ocr, shot_tag=tag)
+                    except Exception as e:  # noqa: BLE001
+                        ok, msg = False, "抛异常: %s" % e
                     if ok:
                         log.warning("[login] %s %s", game, msg)
                         done.set()
