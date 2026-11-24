@@ -59,7 +59,10 @@ MAIN_VALUE = "MIHOYOSDK_ADL_0"
 
 SENTINEL_MAX = 100
 MIN_GOOD = 800
-SAFE_MAX = 2150         # >= 这个长度 = 已经逼近解析失败（实测 2104 能读、2200 读不了）
+SAFE_MAX = 2150         # 实测 2104 还能读、2200 就读不了了 —— 这是"绝对红线"
+PREEMPT_MAX = 1800      # ★ 2026-11-24：到这个长度就【提前】换回小快照，不等游戏自己清空。
+                        #   实测这份记录每天大约 +96~108 字节（一条账号记录），
+                        #   1304 → 2200 用了 7 天；提前处理就不必让用户看见登录框。
 SNAP_TARGET_MAX = 1600  # 优先恢复到不超过这个长度的快照，留出「再长几天」的余地
 KEEP_SNAPS = 30
 SNAP_MAX_AGE_DAYS = 30
@@ -110,6 +113,36 @@ def write_all(game: str, values: dict) -> list:
     return done
 
 
+def delete_adl(game: str, values=None) -> list:
+    """只删掉 MIHOYOSDK_ADL* 这一组值（先备份），别的键一个都不碰。
+
+    为什么可以删：2026-11-24 实测，被游戏清成 24 字节哨兵
+    (wNQYrQRZlRRz8GFZip3P5w==) 之后，每次启动都会刷
+    「failed to parse account list / Decode exception」—— 它已经不是"空列表"，
+    而是一段解不开的垃圾。米哈游官方客服对"PC 端无法保存登录记录"给的办法就是
+    【删掉注册表里的登录记录，重启游戏让它重写】；社区（头条/贴吧）对
+    "原神+星铁 同时安装后账号记录乱码"给的也是同一套做法。
+    这里只删 ADL 两个值、保留 Screenmanager/USD_/其余一切设置，是最小等价操作。
+    """
+    path = GAMES.get(game)
+    if not path:
+        raise KeyError("未知游戏: %s" % game)
+    vals = read_all(game) if values is None else values
+    if not vals:
+        return []
+    deleted = []
+    with _open(path, writable=True) as k:
+        for name in list(vals):
+            if not name.startswith(VALUE_PREFIX):
+                continue
+            try:
+                winreg.DeleteValue(k, name)
+                deleted.append(name)
+            except FileNotFoundError:
+                pass
+    return deleted
+
+
 def classify(values: dict) -> str:
     """missing / small / empty / big / good"""
     main = values.get(MAIN_VALUE)
@@ -118,7 +151,7 @@ def classify(values: dict) -> str:
     n = len(main)
     if n <= SENTINEL_MAX:
         return "empty"
-    if n >= SAFE_MAX:
+    if n >= PREEMPT_MAX:
         return "big"
     if n < MIN_GOOD:
         return "small"
@@ -243,18 +276,19 @@ def check_and_repair(game: str, dry: bool = False, log=None) -> dict:
     vals = read_all(game)
     kind = classify(vals)
     info = {"game": game, "before": kind, "size": main_size(vals),
-            "action": "none", "after": kind, "snapshot": "", "backup": ""}
+            "action": "none", "after": kind, "snapshot": "", "backup": "",
+            "needs_login": False}
     cn = GAME_CN.get(game, game)
 
     if kind in ("missing", "empty"):
-        _log("warning", "[登录态] %s 的「记住的账号」已经被游戏清空（%d 字节），"
-                        "准备用最近一份好快照恢复" % (cn, main_size(vals)))
+        _log("warning", "[登录态] %s 的「记住的账号」已经被游戏清空/删掉了（%d 字节），"
+                        "准备清干净后重新登录一次" % (cn, main_size(vals)))
     elif kind == "small":
         _log("warning", "[登录态] %s 的「记住的账号」只剩 %d 字节（正常 1300 以上，"
-                        "多半是写了一半），按坏的恢复" % (cn, main_size(vals)))
+                        "多半是写了一半），按坏的处理" % (cn, main_size(vals)))
     elif kind == "big":
-        _log("warning", "[登录态] %s 的「记住的账号」已经长到 %d 字节"
-                        "（实测 2200 就会解析失败），先恢复到一份更小的快照" % (cn, main_size(vals)))
+        _log("warning", "[登录态] %s 的「记住的账号」已经长到 %d 字节（每天约 +100，"
+                        "%d 就会解析失败），先换回一份更小的快照" % (cn, main_size(vals), SAFE_MAX))
     else:
         p = save_snapshot(game, "run-start")
         if p:
@@ -262,32 +296,57 @@ def check_and_repair(game: str, dry: bool = False, log=None) -> dict:
             _log("info", "[登录态] %s 正常（%d 字节），已留快照 %s" % (cn, main_size(vals), p.name))
         return info
 
-    snap = best_snapshot(game)
-    if snap is None:
-        info["action"] = "no-snapshot"
-        _log("warning", "[登录态] %s 没有可用的历史快照，这一趟只能靠登录兜底（账号密码）" % cn)
-        return info
-    path, values = snap
-    if classify(values) != "good":
-        info["action"] = "no-snapshot"
-        _log("warning", "[登录态] 快照 %s 本身不可用（%s），跳过" % (path.name, classify(values)))
-        return info
-    if dry:
-        info["action"] = "would-restore"
-        info["snapshot"] = path.name
-        return info
+    # 「太长」（还没坏，但明天必坏）→ 先试着换回一份又新又小的快照：
+    # 那样游戏还能静默登录，不用逼着用户/我们去输一次密码。
+    if kind == "big":
+        snap = best_snapshot(game)
+        if snap is not None:
+            path, values = snap
+            if classify(values) == "good":
+                if dry:
+                    info["action"] = "would-restore"
+                    info["snapshot"] = path.name
+                    return info
+                bak = backup_current(game, vals)
+                if bak:
+                    info["backup"] = bak.name
+                write_all(game, values)
+                after = read_all(game)
+                info["action"] = "restored"
+                info["after"] = classify(after)
+                info["snapshot"] = path.name
+                _log("warning", "[登录态] 已把 %s 的「记住的账号」恢复到快照 %s（%d -> %d 字节，"
+                                "恢复前的值备份在 %s）"
+                     % (cn, path.name, main_size(values), main_size(after),
+                        bak.name if bak else "无"))
+                return info
 
+    # 剩下的一律按"已经解不开了"处理：备份 → 只删 MIHOYOSDK_ADL* → 交给登录抢救。
+    # ★ 2026-11-24：以前这里是"用旧快照覆盖"，但被清空/写坏说明那份 token 已经作废，
+    #   把旧密文写回去只会让游戏继续报 failed to parse account list。
     bak = backup_current(game, vals)
     if bak:
         info["backup"] = bak.name
-    write_all(game, values)
+    if dry:
+        info["action"] = "would-clean"
+        info["needs_login"] = True
+        return info
+    try:
+        deleted = delete_adl(game, vals)
+    except Exception as e:  # noqa: BLE001
+        info["action"] = "clean-failed"
+        info["needs_login"] = True
+        _log("error", "[登录态] %s 删除坏掉的登录记录失败: %s（继续靠登录抢救）" % (cn, e))
+        return info
     after = read_all(game)
-    info["action"] = "restored"
+    info["action"] = "cleaned"
     info["after"] = classify(after)
-    info["snapshot"] = path.name
-    _log("warning", "[登录态] 已把 %s 的「记住的账号」恢复到快照 %s（%d -> %d 字节，"
-                    "恢复前的值备份在 %s）"
-         % (cn, path.name, main_size(values), main_size(after), bak.name if bak else "无"))
+    info["deleted"] = deleted
+    info["needs_login"] = True
+    _log("warning",
+         "[登录态] %s 的「记住的账号」已坏（%s，%d 字节）：已备份到 %s，"
+         "只删掉 %d 个 ADL 值让它重新生成 —— 这趟先用账号密码登录一次"
+         % (cn, info["before"], info["size"], bak.name if bak else "无", len(deleted)))
     return info
 
 

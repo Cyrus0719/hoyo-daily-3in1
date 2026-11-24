@@ -1081,6 +1081,10 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
         max_try = 3
         t_begin = time.time()
         deadline = time.time() + timeout_s
+        adl_was = _adl_ok(game)      # 上一轮「记住的账号」还在不在
+        n_skip = 0                    # 连续多少轮因为"窗口不在前台"看不了一眼
+        t_skip_msg = 0.0
+        force = False                 # 拿不到前台时，这一轮允许抢一次
         try:
             while time.time() < deadline:
                 if stop_event is not None and stop_event.is_set():
@@ -1092,13 +1096,32 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                 if not hwnd:
                     time.sleep(interval_s)
                     continue
+                # ★ 2026-11-24：以前这条线程在"游戏窗口不在前台"时一声不响地跳过，
+                #   原神 11-24 12:02 掉登录时它整场没吭一声，等于失明。现在：
+                #   ① 注册表里的记录一没了就说明"这一刻正在掉登录"，立刻值得抢一次前台去干活；
+                #   ② 别的跳过也至少每分钟留一句话，日志里能看出它活着。
+                now_ok = _adl_ok(game)
+                if not now_ok and adl_was:
+                    log.warning("[login] %s 的「记住的账号」就在刚刚被清空/写坏 —— 掉登录的时刻就是现在", game)
+                    force = True
+                adl_was = now_ok
                 tag = time.strftime("%Y%m%d-%H%M%S")
                 shot = SHOT_DIR / ("%s_%s_probe.png" % (game, tag))
-                if not _grab(hwnd, shot, raise_=False):
+                grabbed = _grab(hwnd, shot, raise_=False)
+                if not grabbed and force:
+                    grabbed = _grab(hwnd, shot, raise_=True)
+                    force = False
+                if not grabbed:
                     # 不是前台（游戏窗口被别的窗口盖着 / 用户在干别的）—— 这轮跳过，
                     # 绝不抢焦点、也不 OCR 别人的画面
+                    n_skip += 1
+                    if time.time() - t_skip_msg > 60:
+                        t_skip_msg = time.time()
+                        log.info("[login] %s 游戏窗口不在前台（已跳过 %d 轮），等它到前台再看",
+                                 game, n_skip)
                     time.sleep(interval_s)
                     continue
+                n_skip = 0
                 boxes = _ocr_safe(ocr, shot)
                 if is_login_screen(boxes):
                     # ★ 2026-11-20：登录框刚冒出来时【先别动手】。
@@ -1224,10 +1247,37 @@ def _login_grace(game: str) -> int:
     return 20 if _adl_len(game) > _ADL_SENTINEL_LEN else 6
 
 
+# 三款游戏共享的设备指纹（HKCU\Software\miHoYoSDK）。
+# 2026-11-24 复盘：那天三款【同时】掉登录，而"记住的账号"本身长度正常（1304）却解析失败 ——
+# 这和"解密的设备钥匙变了"表现一致。把它的指纹一起记下来，下次再"同时掉"就能一眼看出
+# 是不是这把共享钥匙被动过（变了 = 所有旧记录都解不开，只能重登）。
+_SDK_KEY = "Software\\miHoYoSDK"
+_SDK_VALS = ("MIHOYOSDK_DEVICE_ID", "MIHOYOSDK_SEED_ID")
+
+
+def _sdk_fp() -> str:
+    try:
+        import winreg  # noqa: PLC0415
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SDK_KEY) as k:
+            parts = []
+            for name in _SDK_VALS:
+                try:
+                    val, _typ = winreg.QueryValueEx(k, name)
+                except OSError:
+                    parts.append("%s=none" % name.replace("MIHOYOSDK_", "").lower())
+                    continue
+                raw = str(val).encode("utf-8", "replace")
+                parts.append("%s=%d:%s" % (name.replace("MIHOYOSDK_", "").lower(),
+                                           len(raw), hashlib.sha1(raw).hexdigest()[:8]))
+            return "sdk." + " ".join(parts)
+    except OSError:
+        return "sdk.missing"
+
+
 def adl_fingerprint() -> str:
-    """三个游戏记住的账号数据的指纹（不落原文，只落长度+哈希）。"""
+    """三个游戏记住的账号数据的指纹（不落原文，只落长度+哈希）+ 共享设备钥匙的指纹。"""
     m = _adl_map()
-    return " ".join("%s=%s" % (k, m[k]) for k in m)
+    return " ".join("%s=%s" % (k, m[k]) for k in m) + " | " + _sdk_fp()
 
 
 def snapshot_adl(tag: str) -> None:
@@ -1323,71 +1373,120 @@ def sdk_needs_password(game: str) -> bool:
     return pwd > tok
 
 
-def preflight_login(game: str, exe: str, launch_cmd=None, cwd=None,
-                    wait_window_s: int = 240, max_wait_s: int = 120,
-                    close_after: bool = True):
-    """自己先把游戏开到登录界面 → 用账号密码登录 → 关掉游戏（让它把 token 写回本地）。
+def _adl_ok(game: str) -> bool:
+    """「记住的账号」现在是不是一份能用的记录（>100 字节且不是 24 字节哨兵）。"""
+    return _adl_len(game) > _ADL_SENTINEL_LEN
 
-    为什么需要（2026-11-16）：三月七从"游戏切到前台"到判死「账号登录过期」只有约 16 秒，
-    然后 terminate + 重启游戏，最多 3 次（用户看到的"游戏一直退出又启动"）。
-    后台 watch() 线程再快也抢不过它的看门狗。所以先把登录这一关自己过掉：
-    登录成功后游戏会把 token 落盘，上游就能像平常一样自动登录。
-    返回 (ok, message)；ok=False 只是"没登上"，调用方自己决定要不要继续。"""
+
+def rescue_login(game: str, exe: str, launch_cmd=None, cwd=None,
+                 wait_window_s: int = 240, login_wait_s: int = 240,
+                 verify_s: int = 90, close_after: bool = True):
+    """掉登录【抢救】：把游戏开起来 → 账号密码登录一次 → 校验「记住的账号」真的写回本地 → 优雅关掉游戏。
+
+    与 2026-11-16 那版"预登录"的区别（那版是元凶，已删）：
+      * 只在**已经确认账号没了**（adl_guard 判定坏/空）时才调用，不是每次都跑；
+      * 成功标准不是"登录界面消失了"，而是【注册表里的记录真的回来了】——
+        界面消失可能只是弹出了别的页（11-20 那次点进《用户协议》就被误判成登录成功）；
+      * 关游戏前一定等它存活够久（game_proc.close 的 60 秒最小年龄），并把退出后的记录再核对一次。
+
+    返回 (ok, message)。ok=False 只是"这趟没登上"，调用方照常往下跑（引擎还有自己的兜底）。
+    """
     account, password = get_account(game)
     if not account:
         return False, "config/accounts.yaml 没配 %s 的账号密码" % game
-    if launch_cmd:
+
+    import game_proc  # noqa: PLC0415
+
+    launched = False
+    if not game_proc.running(exe):
+        cmd = list(launch_cmd) if launch_cmd else None
+        if not cmd:
+            return False, "没有可用的游戏启动命令"
         try:
-            subprocess.Popen(launch_cmd, cwd=str(cwd) if cwd else None,
-                             creationflags=0x08000000,  # CREATE_NO_WINDOW
-                             stdin=subprocess.DEVNULL)
-            log.info("[login] 预登录：启动游戏 %s", Path(str(launch_cmd[0])).name)
+            subprocess.Popen(cmd, cwd=str(cwd) if cwd else None,
+                             stdin=subprocess.DEVNULL,
+                             creationflags=0x08000000)   # CREATE_NO_WINDOW
+            launched = True
+            log.info("[login] 抢救：游戏没开，先把它拉起来（%s）", Path(str(cmd[0])).name)
         except Exception as e:  # noqa: BLE001
             return False, "启动游戏失败: %s" % e
-    # 等窗口
-    t0 = time.time()
-    hwnd = None
-    while time.time() - t0 < wait_window_s:
-        hwnd, _size = win_guard.find_window(exe)
-        if hwnd:
-            break
-        time.sleep(3)
-    if not hwnd:
-        return False, "等了 %d 秒没等到 %s 窗口" % (wait_window_s, exe)
 
-    ocr = Ocr()
+    ok = False
+    msg = "没等到游戏窗口"
+    ocr = None
     try:
-        t_start = time.time()
-        while time.time() - t_start < max_wait_s:
+        # ① 等窗口（顺便盯着注册表：游戏自己登进去也算成功）
+        t0 = time.time()
+        hwnd = None
+        while time.time() - t0 < wait_window_s:
+            hwnd, _size = win_guard.find_window(exe)
+            if hwnd:
+                break
+            if _adl_ok(game):
+                return True, "游戏自己用记住的账号登进去了（没走到登录界面）"
+            time.sleep(3)
+        if not hwnd:
+            return False, "等了 %d 秒没等到 %s 窗口" % (wait_window_s, exe)
+
+        # ② 等登录界面 → 填表
+        ocr = Ocr()
+        t1 = time.time()
+        while time.time() - t1 < login_wait_s:
+            if _adl_ok(game):
+                ok, msg = True, "登录成功（记住的账号已写回本地）"
+                break
             tag = time.strftime("%Y%m%d-%H%M%S")
-            shot = SHOT_DIR / ("%s_%s_preflight.png" % (game, tag))
-            if not _grab(hwnd, shot):
+            shot = SHOT_DIR / ("%s_%s_rescue.png" % (game, tag))
+            # 这一刻没有别的程序在驱动游戏，抢前台没有副作用；抢不到就跳过这轮
+            if not _grab(hwnd, shot, raise_=True):
                 time.sleep(3)
                 continue
-            boxes = ocr.run(shot)
+            boxes = _ocr_safe(ocr, shot)
             if is_login_screen(boxes):
-                log.warning("[login] 预登录：%s 在登录界面，用账号密码登录（账号 %s）",
+                log.warning("[login] 抢救：%s 停在登录界面，用账号密码登录（账号 %s）",
                             game, _mask(account))
                 ok, msg = try_login(hwnd, game, account, password, ocr, shot_tag=tag,
-                                    max_wait_s=max_wait_s)
-            else:
-                # 已经不是登录界面（多半是 token 还好 / 已经在进游戏）——不用我们管
-                ok, msg = True, "没看到登录界面（不需要登录）"
-            break
+                                    max_wait_s=min(login_wait_s, 180))
+                if ok:
+                    # ③ 界面说成功不算数，等记录真的回来
+                    t2 = time.time()
+                    while time.time() - t2 < verify_s:
+                        if _adl_ok(game):
+                            break
+                        time.sleep(3)
+                    if _adl_ok(game):
+                        ok, msg = True, "登录成功（记住的账号已写回本地）"
+                    else:
+                        ok, msg = False, "点完登录了，但「记住的账号」没写回来（%s）" % msg
+                break
+            time.sleep(3)
         else:
-            ok, msg = False, "%d 秒内没截到可用画面" % max_wait_s
+            ok, msg = False, "%d 秒内没等到登录界面" % login_wait_s
     finally:
-        ocr.close()
-
-    if ok and close_after:
-        try:
-            import game_proc
-            game_proc.close(exe, grace_s=45, force_after_s=180)
-            game_proc.wait_gone(exe, 90)
-            log.info("[login] 预登录完成，已把游戏关掉（token 已写回本地）")
-        except Exception as e:  # noqa: BLE001
-            log.warning("[login] 预登录后关游戏失败: %s", e)
+        if ocr is not None:
+            try:
+                ocr.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if close_after:
+            try:
+                game_proc.close(exe, grace_s=45, force_after_s=180)
+                game_proc.wait_gone(exe, 90)
+                if not _adl_ok(game):
+                    # 有些记录是退出时才落盘的，关掉再看一眼
+                    time.sleep(3)
+                if _adl_ok(game):
+                    ok, msg = True, "登录成功（游戏已关掉，记住的账号在本地）"
+                elif ok:
+                    ok, msg = False, "登录界面走完了，但关掉游戏后记录又没了"
+                log.info("[login] 抢救结束（%s）：%s", "成功" if ok else "失败", msg)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[login] 抢救后关游戏失败: %s", e)
     return ok, msg
+
+
+# 兼容旧名字（2026-11-16 的"预登录"就是它，已按上面的方式重写）
+preflight_login = rescue_login
 
 
 # ---- 绝区零：OneDragon 原生账号密码登录 ---------------------------------------

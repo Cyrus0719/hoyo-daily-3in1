@@ -128,10 +128,14 @@ def run_game(game_key, games_cfg, dry_run=False):
         # 登录态守护（2026-11-23 新增）：游戏自己把「记住的账号」(MIHOYOSDK_ADL*)
         # 写坏/写空时，用最近一份又新又小的快照恢复；健康时顺手留一份快照。
         # 查明的机制：这个值每次启动游戏会变长，长到游戏自己解析不了就整段清空。
+        _adl = {}
         try:
             import adl_guard
             _adl = adl_guard.check_and_repair(game_key, log=log)
-            if _adl.get("action") != "none":
+            if _adl.get("needs_login"):
+                log.warning("[%s] 登录态守护：记住的账号不可用（%s / %d 字节），已备份并清掉，"
+                            "这趟先登录一次", game_key, _adl.get("before"), _adl.get("size") or 0)
+            elif _adl.get("action") != "none":
                 log.warning("[%s] 登录态守护：动作=%s 快照=%s", game_key,
                             _adl.get("action"), _adl.get("snapshot") or "-")
         except Exception as e:
@@ -143,6 +147,28 @@ def run_game(game_key, games_cfg, dry_run=False):
             adl_watch = login_helper.start_adl_watch(game_key)
         except Exception:
             adl_watch = None
+        # 【登录抢救】2026-11-24：原神和崩铁的上游都没有"账号密码登录"（只有绝区零的
+        #   OneDragon 自带），一旦「记住的账号」坏了，引擎只会干等到超时 —— 11-24 12:02
+        #   BetterGI 连着两趟只跑 6~7 秒就收工，树脂一点没刷。所以在起引擎之前，
+        #   只要确认账号已经不可用，就自己把游戏拉起来登录一次、校验记录写回、再优雅关掉。
+        #   绝区零跳过：它 11-24 12:19 被清空后 10 秒内自己就登回去了。
+        if _adl.get("needs_login") and game_key in ("genshin", "starrail"):
+            try:
+                import login_helper
+                import win_guard
+                client = str(g.get("client_path") or "")
+                exe = Path(client).name if client else win_guard.GAME_EXE.get(game_key, "")
+                ok_lg, msg_lg = login_helper.rescue_login(
+                    game_key, exe,
+                    launch_cmd=[client] if client else None,
+                    cwd=Path(client).parent if client else None)
+                if ok_lg:
+                    log.warning("[%s] 登录抢救成功：%s", game_key, msg_lg)
+                else:
+                    log.error("[%s] 登录抢救失败：%s —— 引擎这趟多半跑不动，"
+                              "需要你手动打开游戏登录一次", game_key, msg_lg)
+            except Exception as e:   # noqa: BLE001
+                log.error("[%s] 登录抢救异常（继续跑引擎）: %s", game_key, e)
         adapter.start()
         log.info("[%s] 引擎已启动，等待完成…", game_key)
         ok = adapter.wait(timeout_s=int(g.get("timeout_minutes", 90) * 60))
