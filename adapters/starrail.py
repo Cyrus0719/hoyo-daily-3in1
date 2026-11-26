@@ -126,7 +126,11 @@ def _fatal_hit(text: str) -> str:
 #   从此：① 三月七的控制台输出（PyInstaller 的 traceback 只打到这里）全部落盘；
 #          ② 进程退出必须看退出码 + 跑够时长 + 有完成痕迹；③ 早期退出自动重跑一趟。
 M7A_CONSOLE = BASE / "logs" / "m7a_console.log"
-M7A_DONE_MARKS = ("开拓力", "游戏终止", "任务完成", "已完成", "全部完成")
+# ★ 2026-11-26 事故：这里原本还有 "游戏终止" —— 可那是三月七**每终止一次游戏**就打的
+#   普通一行，不是"干完了"。当天 07:12 它连撞 3 次「账号登录过期」、终止游戏 3 次、
+#   然后崩溃退出（退出码 1），_after_exit() 却因为看到「游戏终止」就当有完成痕迹 →
+#   139 秒的彻底失败被记成 ok=True。从此完成痕迹只认真的干完活儿的那几个词。
+M7A_DONE_MARKS = ("开拓力", "任务完成", "已完成", "全部完成")
 EARLY_EXIT_S = 240          # 小于这个时长就退出，正常一轮不可能干完
 
 
@@ -278,6 +282,7 @@ class StarRailAdapter:
         self._guard = None
         self._login_stop = None   # 登录兜底线程的停止信号（见 start()）
         self._base = {"name": "", "size": 0}
+        self._last_fatal = ""     # 最近一次命中的致命错误原文（wait() 用它决定要不要救登录）
 
     def _is_admin(self) -> bool:
         try:
@@ -360,8 +365,14 @@ class StarRailAdapter:
             ok, code = self._wait_once(timeout_s)
             if ok:
                 return True
-            if attempt >= 1 or code != "early":
+            if attempt >= 1 or code not in ("early", "fatal"):
                 return False
+            if code == "fatal" and "登录过期" in (self._last_fatal or ""):
+                # ★ 2026-11-26：光重跑没用 —— 账号没登回去，第二趟一定还是同样的崩溃。
+                #   先把游戏关干净、用账号密码登一次（rescue_login 会核对"记住的账号"真的写回），
+                #   成功了再重跑。救不回来就直接判失败，别浪费一小时。
+                if not self._repair_login():
+                    return False
             log.warning("[March7th] 这一趟没干成（%s）—— 重跑一趟（第 2 次）", code)
             try:
                 # 只杀引擎：stop() 会连登录兜底和窗口兜底线程一起停掉，重跑就没人看窗口了
@@ -379,10 +390,56 @@ class StarRailAdapter:
                 return False
         return False
 
+    def _repair_login(self) -> bool:
+        """账号登录过期后【先把账号登回去】，再让三月七重跑。
+
+        2026-11-26 现场：07:12:07 游戏启动 6 秒后把「记住的账号」清成 24 字节空值 →
+        三月七连撞 3 次「账号登录过期」、每次都 terminate + 重启游戏 → 07:12:53 放弃 →
+        pause_on_error 要 input() 但没控制台 → EOFError → 进程崩溃退出（用户看到"闪退"）。
+        光重跑一遍还会一模一样。所以这条路必须先救登录：
+          ① 把游戏关干净（game_proc 有 60 秒最小年龄守卫，不会写坏登录数据）；
+          ② rescue_login：拉起游戏 → 账号密码登录 → 核对注册表里的记录真的回来了 → 关掉；
+          ③ 重建登录兜底线程和窗口兜底（原来那两条是绑在上一趟上的）。
+        """
+        if login_helper is None:
+            log.error("[March7th] 没有 login_helper，无法自动登录，需要你手动打开崩铁登录一次")
+            return False
+        path = self.cfg.get("client_path", "")
+        exe = Path(path).name if path else "StarRail.exe"
+        try:
+            game_proc.close(exe, grace_s=45, force_after_s=180)
+            game_proc.wait_gone(exe, 90)
+        except Exception as e:   # noqa: BLE001
+            log.warning("[March7th] 救登录前关游戏出问题: %s", e)
+        log.warning("[March7th] 账号登录过期 —— 先用账号密码自己登录一次，成功后再重跑")
+        try:
+            ok, msg = login_helper.rescue_login(
+                "starrail", exe,
+                launch_cmd=[path] if path else None,
+                cwd=Path(path).parent if path else None)
+        except Exception as e:   # noqa: BLE001
+            log.error("[March7th] 登录抢救抛异常: %s", e)
+            return False
+        if not ok:
+            log.error("[March7th] 登录抢救失败：%s —— %s", msg, M7A_FATAL_HINT)
+            return False
+        log.warning("[March7th] 登录抢救成功：%s", msg)
+        # 兜底线程是绑在上一趟上的，重跑前重建（stop() 会把它们 set 掉，不能直接复用）
+        try:
+            self._login_stop = threading.Event()
+            if self.cfg.get("auto_login", True):
+                login_helper.watch(exe, "starrail", stop_event=self._login_stop,
+                                   timeout_s=3600, interval_s=3)
+            self._guard = win_guard.watch_async("starrail")
+        except Exception as e:   # noqa: BLE001
+            log.warning("[March7th] 重建兜底线程失败（不影响重跑）: %s", e)
+        return True
+
     def _wait_once(self, timeout_s: int):
         """盯一趟。返回 (ok, code)，code ∈ done / fatal / stall / early / timeout。"""
         end = time.time() + timeout_s
         t_begin = time.time()
+        self._last_fatal = ""
         stall_s = float(self.cfg.get("stall_minutes", 15)) * 60
         last_size = _log_size()
         last_progress = time.time()
@@ -403,6 +460,7 @@ class StarRailAdapter:
             misses = 0
             hit = _fatal_hit(_log_text_after(self._base))
             if hit:
+                self._last_fatal = hit
                 log.error("[March7th] 引擎报致命错误『%s』—— 判定失败并立即结束进程"
                           "（不再干等超时，免得把后面的游戏挤掉）", hit)
                 if "登录过期" in hit:
@@ -438,6 +496,16 @@ class StarRailAdapter:
         log.info("[March7th] 引擎进程已退出（退出码 %s，本趟 %.0f 秒，日志 %d 字）",
                  rc, elapsed, len(text))
         _scan_today_log()   # 进程退出 ≠ 干完了：把"没干完"的痕迹写进 daily.log
+        # ★ 2026-11-26：先看是不是被致命错误逼退的。当天日志里出现 3 次「游戏终止」，
+        #   旧逻辑把「游戏终止」当完成痕迹 → 139 秒的崩溃被记成 ok=True。
+        hit = _fatal_hit(text)
+        if hit:
+            self._last_fatal = hit
+            log.error("[March7th] 引擎是被『%s』逼退的（退出码 %s，本趟 %.0f 秒）—— 判失败"
+                      "（完整控制台输出见 logs/%s）", hit, rc, elapsed, M7A_CONSOLE.name)
+            if "登录过期" in hit:
+                log.error("[March7th] %s", M7A_FATAL_HINT)
+            return False, "fatal"
         if elapsed < EARLY_EXIT_S and not has_done:
             log.error("[March7th] 引擎只跑了 %.0f 秒就退出，日志里没有任何完成痕迹 —— 判失败"
                       "（完整控制台输出见 logs/%s）", elapsed, M7A_CONSOLE.name)

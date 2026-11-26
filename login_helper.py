@@ -142,6 +142,36 @@ def _mask(text: str) -> str:
 
 
 # ---- 窗口 --------------------------------------------------------------------
+def _wait_usable_window(exe: str, hwnd: int = 0, timeout_s: float = 120):
+    """等到一个【客户区能用】的游戏窗口，返回 (hwnd, rect)。
+
+    2026-11-26 事故：崩铁 07:12:07 掉登录，三月七在「终止 → 重启」游戏，
+    我们手里那个 hwnd 正在销毁（客户区 0×0）；try_login 只等 8 秒就报
+    「窗口尺寸异常」，两次机会全丢，最后整轮空跑还被记成 ok=True。
+    现在：① 等得更久；② 每一轮都重新找窗口 —— 重启之后的 hwnd 是个新的。
+    """
+    t_end = time.time() + max(1.0, timeout_s)
+    cur = int(hwnd or 0)
+    while True:
+        if cur:
+            rect = _client_rect(cur)
+            if rect and rect[2] >= 320 and rect[3] >= 180:
+                return cur, rect
+        if exe:
+            try:
+                h2, _size = win_guard.find_window(exe)
+            except Exception:   # noqa: BLE001
+                h2 = 0
+            if h2 and h2 != cur:
+                rect = _client_rect(h2)
+                if rect and rect[2] >= 320 and rect[3] >= 180:
+                    return h2, rect
+                cur = h2
+        if time.time() >= t_end:
+            return (int(hwnd or 0), None)
+        time.sleep(0.5)
+
+
 def _client_rect(hwnd):
     rect = wt.RECT()
     if not u.GetClientRect(hwnd, ctypes.byref(rect)):
@@ -890,7 +920,8 @@ def _submit_login(hwnd, ox, oy, boxes, pwd_field, ocr, tag, game: str,
 
 
 def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
-              shot_tag: str = "", max_wait_s: int = 150):
+              shot_tag: str = "", max_wait_s: int = 150,
+              exe: str = "", window_wait_s: float = 120):
     """在已经确认是登录界面的窗口上，走一遍账号密码登录。返回 (ok, message)。
 
     每一步都回读屏幕确认，任何一步对不上就停手：宁可不登录，也不乱输密码。
@@ -899,22 +930,22 @@ def try_login(hwnd, game: str, account: str, password: str, ocr: "Ocr",
     tag = shot_tag or time.strftime("%Y%m%d-%H%M%S")
     rect = _client_rect(hwnd)
     if not rect:
-        # 游戏刚起来时客户区可能还是 0×0（2026-11-23 崩铁就是这样：直接报
-        # 「窗口尺寸异常」放弃了，那天两次机会都白丢）。现在先等最多 8 秒。
-        for _ in range(16):
-            time.sleep(0.5)
-            rect = _client_rect(hwnd)
-            if rect:
-                break
+        # 游戏刚起来 / 正在被引擎重启时客户区会一直是 0×0。
+        # 2026-11-23：只等 8 秒就放弃了；2026-11-26：三月七正在「终止 → 重启」，
+        # 我们手里那个 hwnd 已经销毁、新的还没建好 —— 两次尝试全废，整轮空跑。
+        # 现在等得更久，而且每一轮都【重新找窗口】（重启后的 hwnd 是新的）。
+        hwnd2, rect = _wait_usable_window(exe, hwnd, timeout_s=window_wait_s)
+        if hwnd2:
+            hwnd = hwnd2
     if not rect:
-        return False, "窗口尺寸异常（等了 8 秒客户区还是 0×0）"
+        return False, "窗口尺寸异常（等了 %d 秒也没有可用的客户区）" % int(window_wait_s)
     ox, oy = rect[0], rect[1]
 
     def screen(box):
         x, y = _center(box)
         return ox + x, oy + y
 
-    width = rect[2] - rect[0]
+    width = rect[2]          # rect = (x, y, 宽, 高)
 
     shot = SHOT_DIR / ("%s_%s_0.png" % (game, tag))
     if not _grab(hwnd, shot):
@@ -1061,7 +1092,8 @@ def login_once(game: str, exe: str, tag: str = "", max_wait_s: int = 150):
         account, password = get_account(game)
         if not account:
             return False, "config/accounts.yaml 里没有 %s 的账号密码" % game
-        return try_login(hwnd, game, account, password, ocr, shot_tag=tag, max_wait_s=max_wait_s)
+        return try_login(hwnd, game, account, password, ocr, shot_tag=tag, max_wait_s=max_wait_s,
+                         exe=exe)
     finally:
         ocr.close()
 
@@ -1079,6 +1111,7 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
         ocr = Ocr()
         tried = 0
         max_try = 3
+        win_fail = 0                  # 连续多少轮"游戏正在重启、窗口还没建好"（不算一次尝试）
         t_begin = time.time()
         deadline = time.time() + timeout_s
         adl_was = _adl_ok(game)      # 上一轮「记住的账号」还在不在
@@ -1155,9 +1188,23 @@ def watch(exe: str, game: str, stop_event: threading.Event = None,
                     log.warning("[login] %s 掉登录了，自动用账号密码登录（账号 %s）", game, _mask(account))
                     tried += 1
                     try:
-                        ok, msg = try_login(hwnd, game, account, password, ocr, shot_tag=tag)
+                        ok, msg = try_login(hwnd, game, account, password, ocr, shot_tag=tag,
+                                            exe=exe, window_wait_s=180)
                     except Exception as e:  # noqa: BLE001
                         ok, msg = False, "抛异常: %s" % e
+                    if not ok and "窗口尺寸异常" in (msg or ""):
+                        # 2026-11-26：三月七在「终止 → 重启」游戏，我们手里那个 hwnd 正在销毁，
+                        # 新窗口还没建好 —— 这不是"登录失败"，是"还没轮到我们"。
+                        # 不能算掉一次机会（当天 2 次机会就这么丢的），等它重启完再看。
+                        win_fail += 1
+                        tried -= 1
+                        log.warning("[login] %s 的游戏窗口正在重启（%d），等它起来再看", game, win_fail)
+                        if win_fail >= 5:
+                            log.warning("[login] %s 连续 %d 轮都没有可用的游戏窗口，放弃这一趟", game, win_fail)
+                            done.set()
+                            return
+                        time.sleep(5)
+                        continue
                     if ok:
                         log.warning("[login] %s %s", game, msg)
                         done.set()
@@ -1446,7 +1493,8 @@ def rescue_login(game: str, exe: str, launch_cmd=None, cwd=None,
                 log.warning("[login] 抢救：%s 停在登录界面，用账号密码登录（账号 %s）",
                             game, _mask(account))
                 ok, msg = try_login(hwnd, game, account, password, ocr, shot_tag=tag,
-                                    max_wait_s=min(login_wait_s, 180))
+                                    max_wait_s=min(login_wait_s, 180), exe=exe,
+                                    window_wait_s=min(wait_window_s, 120))
                 if ok:
                     # ③ 界面说成功不算数，等记录真的回来
                     t2 = time.time()
